@@ -6,7 +6,8 @@ script lives in its own subdirectory with its own clasp config and README.
 ## Scripts
 
 - [`Deduplicator/`](Deduplicator/README.md) — scans a Drive folder, finds duplicates by
-  **content hash**, and trashes them. Bound to the **DuplicateFinder** Sheet.
+  **content hash** (Drive's own md5, no downloads), and trashes them. Bound to the
+  **DuplicateFinder** Sheet, which also stores the scan checkpoint and results.
 - [`MergeGoogleFolders/`](MergeGoogleFolders/README.md) — recursively **merges** a source
   Drive folder tree into a destination, matching by **name** (newest wins), with a safe
   dry-run mode.

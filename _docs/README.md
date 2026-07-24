@@ -7,8 +7,10 @@ run `clasp pull` / `clasp push` from **inside** the relevant subdirectory.
 ## Scripts
 
 ### [`Deduplicator/`](../Deduplicator/README.md)
-Recursively scans a Drive folder, finds duplicate files by **content hash**, and moves
-duplicates to Trash. Bound to the **DuplicateFinder** Sheet.
+Recursively scans a Drive folder, finds duplicate files by **content hash** (Drive's own
+`md5Checksum`, so no file is downloaded), and moves duplicates to Trash. Bound to the
+**DuplicateFinder** Sheet, which doubles as the checkpoint store — scans resume across
+the Apps Script 6-minute limit.
 → [README](../Deduplicator/README.md)
 
 ### [`MergeGoogleFolders/`](../MergeGoogleFolders/README.md)

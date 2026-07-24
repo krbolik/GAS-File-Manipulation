@@ -6,18 +6,20 @@
     .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); }
     #url { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; margin-bottom: 12px; }
     .btn { background: #007aff; color: white; border: none; padding: 12px; border-radius: 8px; cursor: pointer; width: 100%; font-weight: bold; }
+    .btn:disabled { background: #b0c4de; cursor: default; }
     .status-area { margin-top: 15px; padding: 12px; background: #eef2f7; border-radius: 8px; border-left: 4px solid #34c759; }
     .label { font-size: 10px; color: #666; text-transform: uppercase; font-weight: bold; }
     #parent-txt, #folder-txt, #file-txt { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
-    #results { height: 220px; overflow-y: auto; margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; }
-    .dupe-row { padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 11px; word-break: break-all; }
+    #counts { font-size: 11px; color: #666; margin-top: 8px; }
+    #results { min-height: 120px; max-height: 220px; overflow-y: auto; margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; }
+    .note { color: #666; font-size: 11px; }
   </style>
 </head>
 <body>
   <div class="card">
     <input type="text" id="url" placeholder="Paste Google Drive URL here...">
     <button id="mainBtn" class="btn" onclick="startScan()">Analyze Folder</button>
-    
+
     <div class="status-area">
       <div class="label">Parent Folder:</div>
       <div id="parent-txt">Idle</div>
@@ -25,6 +27,7 @@
       <div id="folder-txt">Idle</div>
       <div class="label" style="margin-top:8px">Active File:</div>
       <div id="file-txt">Ready</div>
+      <div id="counts"></div>
     </div>
 
     <div id="results"></div>
@@ -33,72 +36,111 @@
 
   <script>
     let pollInterval;
-    let displayQueue = [];
-    let isUpdating = false;
-    let dupeIds = [];
+    let scanUrl = '';
 
-    async function processQueue() {
-      if (isUpdating || displayQueue.length === 0) return;
-      isUpdating = true;
-      while (displayQueue.length > 0) {
-        const item = displayQueue.shift();
-        document.getElementById('parent-txt').innerText = item.currentParent || "Scanning...";
-        document.getElementById('folder-txt').innerText = item.currentFolder || "...";
-        document.getElementById('file-txt').innerText = item.currentFile || "...";
-        await new Promise(r => setTimeout(r, 800));
-      }
-      isUpdating = false;
+    function poll() {
+      google.script.run.withSuccessHandler(s => {
+        if (!s) return;
+        document.getElementById('parent-txt').innerText = s.currentParent || 'Scanning...';
+        document.getElementById('folder-txt').innerText = s.currentFolder || '...';
+        document.getElementById('file-txt').innerText = s.currentFile || '...';
+        document.getElementById('counts').innerText =
+          (s.files ? s.files + ' files' : '') + (s.folders ? '  ·  folder ' + s.folders : '');
+      }).getLiveStatus();
     }
 
     function startScan() {
-      const url = document.getElementById('url').value;
-      if (!url.startsWith('http')) return alert("Error: Please paste a Google Drive URL.");
-      
-      document.getElementById('results').innerHTML = "Scanning recursively...";
-      
-      pollInterval = setInterval(() => {
-        google.script.run.withSuccessHandler(data => {
-          if (data) { displayQueue.push(data); processQueue(); }
-        }).getLiveStatus();
-      }, 1000);
+      const url = document.getElementById('url').value || scanUrl;
+      if (!url.startsWith('http')) return alert('Error: Please paste a Google Drive URL.');
+      scanUrl = url;
 
-      google.script.run.withSuccessHandler(handleFinish).processFolder(url);
+      document.getElementById('mainBtn').disabled = true;
+      document.getElementById('delBtn').style.display = 'none';
+      document.getElementById('results').innerHTML = 'Scanning...';
+
+      clearInterval(pollInterval);
+      pollInterval = setInterval(poll, 1000);
+      google.script.run.withSuccessHandler(handleFinish)
+                       .withFailureHandler(handleFailure)
+                       .processFolder(url);
+    }
+
+    function handleFailure(err) {
+      clearInterval(pollInterval);
+      document.getElementById('mainBtn').disabled = false;
+      document.getElementById('results').innerHTML = '<b>Failed:</b> ' + err.message;
     }
 
     function handleFinish(res) {
-      clearInterval(pollInterval);
-      if (res.error) { alert(res.error); return; }
-      
+      if (res.error) {
+        clearInterval(pollInterval);
+        document.getElementById('mainBtn').disabled = false;
+        document.getElementById('results').innerHTML = '<b>Error:</b> ' + res.error;
+        return;
+      }
+
       if (res.timeout) {
-        document.getElementById('results').innerHTML = `<b>Timeout reached (${res.count} files scanned).</b><br>Resuming automatically in 3 seconds...`;
+        document.getElementById('results').innerHTML =
+          '<b>' + res.phase + ' paused at the 6-minute limit (' + res.count + ' files so far).</b>' +
+          '<br>Resuming automatically in 3 seconds...';
         setTimeout(startScan, 3000);
         return;
       }
 
+      clearInterval(pollInterval);
+      poll();
+      document.getElementById('mainBtn').disabled = false;
+
       const resDiv = document.getElementById('results');
-      if (!res.dupes || res.dupes.length === 0) {
-        resDiv.innerHTML = "<b>Complete! No duplicates found.</b>";
-      } else {
-        dupeIds = res.dupes.map(d => d.duplicate.id);
-        resDiv.innerHTML = `<b>Found ${res.dupes.length} duplicates:</b>`;
-        res.dupes.forEach(p => {
-          const origPath = p.original.fullPath;
-          const dupePath = p.duplicate.fullPath;
-          resDiv.innerHTML += `
-            <div class="dupe-row">
-              🗑️ ${p.duplicate.name}<br>
-              <span style="color:#666">Path: ${dupePath}</span><br>
-              <span style="color:#888">Original in: ${origPath}</span>
-            </div>`;
-        });
-        document.getElementById('delBtn').style.display = "block";
+      if (!res.dupeCount) {
+        resDiv.innerHTML = '<b>Complete — no duplicates found.</b><br>' +
+          '<span class="note">' + res.totalFiles + ' files scanned, ' + res.skipped +
+          ' skipped (Google-native or empty).</span>';
+        return;
       }
+
+      resDiv.innerHTML =
+        '<b>Found ' + res.dupeCount + ' duplicates</b> out of ' + res.totalFiles + ' files.<br>' +
+        '<span class="note">' + res.skipped + ' files skipped (Google-native or empty — these are ' +
+        'never reported as duplicates).</span><br><br>' +
+        'The full list is in the <a href="' + res.sheetUrl + '" target="_blank"><b>Duplicates</b></a> sheet. ' +
+        'Review it there, delete any row you want to keep, then trash the rest.';
+      window.dupeCount = res.dupeCount;
+      document.getElementById('delBtn').style.display = 'block';
     }
 
     function confirmDelete() {
-      if (confirm(`Move ${dupeIds.length} files to Trash?`)) {
-        google.script.run.withSuccessHandler(() => { alert("Done!"); google.script.host.close(); }).deleteSelectedFiles(dupeIds);
-      }
+      if (!confirm('Move ' + window.dupeCount + ' files to Trash?\n\nOnly the duplicate copy is trashed; ' +
+                   'the original stays. Trashed files remain recoverable from Drive Trash.')) return;
+      document.getElementById('delBtn').disabled = true;
+      clearInterval(pollInterval);
+      pollInterval = setInterval(poll, 1000);
+      window.trashedTotal = 0;
+      window.errorTotal = 0;
+      runTrash();
+    }
+
+    function runTrash() {
+      google.script.run.withSuccessHandler(res => {
+        if (res.error) {
+          clearInterval(pollInterval);
+          document.getElementById('delBtn').disabled = false;
+          return alert(res.error);
+        }
+        window.trashedTotal += res.trashed;
+        window.errorTotal += res.errors;
+        if (res.remaining > 0) {
+          document.getElementById('results').innerHTML =
+            '<b>Trashing...</b> ' + res.remaining + ' left. Resuming after the 6-minute limit...';
+          setTimeout(runTrash, 2000);
+          return;
+        }
+        clearInterval(pollInterval);
+        document.getElementById('results').innerHTML =
+          '<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' +
+          (window.errorTotal ? ', ' + window.errorTotal + ' failed — see the Status column in the Duplicates sheet.' : '.');
+        document.getElementById('delBtn').style.display = 'none';
+      }).withFailureHandler(handleFailure).trashDuplicates();
     }
   </script>
 </body>
