@@ -2,18 +2,36 @@
 
 Version-controlled source for the **Tech Angel Deduplicator** Google Apps Script — a
 tool that recursively scans a Google Drive folder, finds duplicate files by content
-hash, and moves them to Trash.
+hash, and moves them to Trash. The script is bound to the **"DuplicateFinder"** Google
+Sheet and is fully functional in production today.
 
-## What the script does
+## How to use
 
-- Adds a **🚀 Angel** menu to the container spreadsheet (`onOpen`): *Start Deduplicator*
-  and *Reset Scan Progress*.
-- `processFolder(url)` recursively walks a Drive folder. Files under 20 MB are hashed
-  with MD5; larger files use a `LARGE_<size>` marker. The scan is **resumable** across
-  the Apps Script 6-minute execution limit via `ScriptProperties`.
-- `Progress.html` is a modeless dialog showing live scan status and the duplicate list,
-  with a **Move Duplicates to Trash** action.
-- Duplicate key = `hash + size`. Matches are trashed via `DriveApp...setTrashed(true)`.
+1. Open the bound Google Sheet
+   ([DuplicateFinder](https://docs.google.com/spreadsheets/d/1DZuoYcTXyTV35llQlO3qmTK6m4NDH3h6-P6R7Jru9D0/edit)).
+2. In the menu bar, click **🚀 Angel → Start Deduplicator**. A dialog opens.
+3. Paste a **Google Drive folder URL** (e.g. `https://drive.google.com/drive/folders/<id>`)
+   and click **Analyze Folder**.
+4. Watch the live status (parent folder / current folder / active file). If the scan hits
+   the Apps Script 6-minute limit it **pauses and auto-resumes** until the whole tree is
+   covered — no action needed.
+5. When the scan finishes, the dialog lists every duplicate with its full path and where
+   the original lives. Click **Move Duplicates to Trash** and confirm.
+6. To discard a paused or stale scan and start clean: **🚀 Angel → Reset Scan Progress**.
+
+> The tool only ever trashes the **duplicate** copy (the first file seen for each
+> content hash is kept as the original). Trashed files stay recoverable from Drive Trash.
+
+## How it works (complete flow)
+
+| Stage | Function(s) | What happens |
+|-------|-------------|--------------|
+| Menu | `onOpen`, `showUi` | Adds the **🚀 Angel** menu and opens `Progress.html` as a modeless dialog. |
+| Scan | `processFolder`, `scanRecursive`, `getFullPath` | Recursively walks the folder. Each file < 20 MB is MD5-hashed; larger files use a `LARGE_<size>` marker. Progress + the file list are checkpointed in `ScriptProperties`. |
+| Resume | `processFolder` (timeout branch) | On the ~5.5-min soft limit the run saves `TEMP_FILE_LIST` + `SCANNED_FOLDERS` and returns `{timeout:true}`; the dialog re-invokes it to continue where it left off. |
+| Detect | `runDeduplication` | Groups files by `hash + size`; the first is the original, later matches are duplicates. |
+| Report | `getLiveStatus`, `Progress.html` | Polls live status during the scan and renders the duplicate list at the end. |
+| Delete | `deleteSelectedFiles` | Moves the selected duplicate IDs to Trash via `DriveApp.getFileById(id).setTrashed(true)`. |
 
 ## Repository layout
 

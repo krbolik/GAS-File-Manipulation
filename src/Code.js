@@ -1,5 +1,12 @@
 /**
  * Tech Angel Deduplicator v4.1 (Resumable + Parent + Full Path)
+ *
+ * HOW TO USE:
+ *   1. In the bound Google Sheet, open the "🚀 Angel" menu → "Start Deduplicator".
+ *   2. Paste a Google Drive folder URL into the dialog and click "Analyze Folder".
+ *   3. Wait for the recursive scan (it auto-resumes if it hits the 6-min limit).
+ *   4. Review the duplicates listed, then click "Move Duplicates to Trash".
+ *   To clear a paused/partial scan: "🚀 Angel" menu → "Reset Scan Progress".
  */
 
 function onOpen() {
