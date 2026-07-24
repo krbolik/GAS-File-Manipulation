@@ -56,9 +56,15 @@ clasp show-authorized-user   # confirm which Google account clasp uses
 > ⚠️ Never commit `.clasprc.json` — it holds OAuth tokens. It lives in your home
 > directory (`~/.clasprc.json`) and is also git-ignored here as a safeguard.
 
-## Known limitation
+## Container binding
 
-`Code.js` uses `SpreadsheetApp.getUi()` and an `onOpen` menu, which only run when the
-script is **bound to a Google Sheet**. If this project is currently standalone, the
-menu will not appear in a spreadsheet — it would need to be container-bound (or the UI
-re-worked as a standalone web app) to be usable in production.
+This is a **container-bound** script, bound to the Google Sheet **"DuplicateFinder"**:
+
+- Spreadsheet ID: `1DZuoYcTXyTV35llQlO3qmTK6m4NDH3h6-P6R7Jru9D0`
+- Sheet URL: <https://docs.google.com/spreadsheets/d/1DZuoYcTXyTV35llQlO3qmTK6m4NDH3h6-P6R7Jru9D0/edit>
+- Owner: kai.bolik@createk.biz
+
+Because it is bound, the `onOpen` **🚀 Angel** menu appears automatically in that
+spreadsheet, and `SpreadsheetApp.getUi()` works. To open the code from the sheet:
+**Extensions → Apps Script**. `clasp pull` / `clasp push` sync this repo with that same
+bound project (scriptId `1U_Ej4u1kFRmR3ywpdnCHmbjImRxuNzZmIu5DRHMw6SpKpHFKzrH-k2lb`).
