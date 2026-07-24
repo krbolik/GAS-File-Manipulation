@@ -1,0 +1,44 @@
+# Optional CI: push each Apps Script project to its live project via clasp.
+#
+# Requires a repository secret named CLASPRC_JSON containing the full contents
+# of your ~/.clasprc.json (the clasp OAuth credentials). Without it the job
+# will fail at the auth step — remove this file or add the secret to enable CI.
+#
+# Add each new script directory to the matrix below.
+name: Deploy Apps Script
+
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+  push:
+    branches: [main]
+    paths:
+      - '*/src/**'
+      - '*/.clasp.json'
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        script:
+          - Deduplicator
+          - MergeGoogleFolders
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install clasp
+        run: npm install -g @google/clasp
+
+      - name: Write clasp credentials
+        run: printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+
+      - name: Push ${{ matrix.script }}
+        working-directory: ${{ matrix.script }}
+        run: clasp push --force
