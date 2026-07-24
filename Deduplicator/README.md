@@ -26,13 +26,17 @@ What changed from v4.1:
 Migration note: the first run after upgrading should start with **🚀 Angel → Reset Scan
 Progress** to clear v4's leftover `TEMP_FILE_LIST` / `SCANNED_FOLDERS` properties.
 
-**v5.0.1** — first live run. The scan itself worked (498 files, real md5 hashes, correct
+**v5.0.1** — first live run. The scan itself worked (real md5 hashes, correct sizes and
 paths), but clearing a checkpoint sheet threw *"Sorry, it is not possible to delete all
-non-frozen rows."* Appending had grown each sheet's grid to exactly fit its data, so
-`maxRows == getLastRow()` and `deleteRows(2, lastRow - 1)` was asking Sheets to delete
-every non-frozen row. Fixed by clearing with `clearContent` instead of `deleteRows`
-(`clearData`), and by growing the grid explicitly in `appendRows` with 100 rows of
-headroom.
+non-frozen rows."* Sheets refuses `deleteRows(2, lastRow - 1)` whenever `maxRows` equals
+the last data row — reachable both by hand-deleting rows and, possibly, by the grid
+growing to exactly fit an append. Fixed by clearing with `clearContent` instead of
+`deleteRows` (`clearData`), which is immune to either, and by growing the grid explicitly
+in `appendRows` with 100 rows of headroom.
+
+> **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
+> `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
+> so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
 
 ## How to use
 
