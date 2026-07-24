@@ -35,9 +35,20 @@
  * ---------------
  *   • DRY_RUN = TRUE  : nothing is moved/trashed; actions are logged as "[DRY RUN] …".
  *                       On timeout it stops; click "Continue Merge" to run the next pass.
- *   • DRY_RUN = FALSE : files/folders are actually moved and older duplicates trashed
- *                       (recoverable from Drive Trash). Long runs auto-resume every
- *                       ~1 min via a time-based trigger until the queue is empty.
+ *   • DRY_RUN = FALSE : files/folders are actually moved and older duplicates removed.
+ *                       Long runs auto-resume every ~1 min via a time-based trigger
+ *                       until the queue is empty.
+ *
+ * OWNERSHIP & DUPLICATE REMOVAL
+ * ----------------------------
+ * In Google Drive, only a file's OWNER can move it to Trash. This script runs as the
+ * script owner, who may not own every file in a shared folder. So an older duplicate is:
+ *   • TRASHED    if the script owner owns it (recoverable from Drive Trash), or
+ *   • QUARANTINED (moved to a "MERGE_DUPLICATES_TO_REVIEW" folder in the script owner's
+ *                  My Drive) if someone else owns it — because a non-owner cannot trash
+ *                  it. Its real owner can then delete it. Every action is logged with the
+ *                  outcome (TRASHED / QUARANTINED / MOVED / FAILED) AFTER it runs, so the
+ *                  Logs tab reflects what actually happened, not just what was intended.
  */
 
 const CONFIG = {
@@ -240,69 +251,164 @@ function processMergeQueue() {
   lock.releaseLock();
 }
 
+const QUARANTINE_FOLDER_NAME = 'MERGE_DUPLICATES_TO_REVIEW';
+const QUARANTINE_PROP_KEY = 'QUARANTINE_FOLDER_ID';
+
+// Per-execution cache of the quarantine folder (globals reset between executions;
+// the folder ID is persisted in Script Properties so chained triggers reuse it).
+let _quarantineFolder = null;
+
 /**
- * Compares files and queues subfolders.
+ * Lazily gets/creates the "duplicates to review" folder in the script owner's My Drive.
+ * Only ever called during a live run (never in dry run).
+ */
+function ensureQuarantineFolder() {
+  if (_quarantineFolder) return _quarantineFolder;
+
+  const props = PropertiesService.getScriptProperties();
+  const savedId = props.getProperty(QUARANTINE_PROP_KEY);
+  if (savedId) {
+    try {
+      _quarantineFolder = DriveApp.getFolderById(savedId);
+      return _quarantineFolder;
+    } catch (e) {
+      // Saved folder was deleted/inaccessible — fall through and recreate.
+    }
+  }
+
+  _quarantineFolder = DriveApp.getRootFolder().createFolder(QUARANTINE_FOLDER_NAME);
+  props.setProperty(QUARANTINE_PROP_KEY, _quarantineFolder.getId());
+  return _quarantineFolder;
+}
+
+/**
+ * Best-effort owner email for a file (null if it can't be determined).
+ */
+function ownerEmailOf(file) {
+  try {
+    const owner = file.getOwner();
+    return owner ? owner.getEmail() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Removes an older duplicate file: trashes it if the script owner owns it (only the
+ * owner can trash), otherwise moves it to the quarantine folder. Logs the real outcome.
+ */
+function removeDuplicate(file, effectiveEmail, isDryRun, logBuffer, name, reason) {
+  const owner = ownerEmailOf(file);
+  const ownedByUs = !!effectiveEmail && !!owner && owner === effectiveEmail;
+
+  if (isDryRun) {
+    pushLog(logBuffer, true, ownedByUs ? 'TRASH' : 'QUARANTINE', name,
+      ownedByUs
+        ? `${reason} Would trash (owned by script owner).`
+        : `${reason} Would quarantine (owner: ${owner || 'unknown'}) — non-owner cannot trash.`);
+    return;
+  }
+
+  try {
+    if (ownedByUs) {
+      file.setTrashed(true);
+      pushLog(logBuffer, false, 'TRASHED', name, `${reason} Trashed (owned by script owner).`);
+    } else {
+      const q = ensureQuarantineFolder();
+      file.moveTo(q);
+      pushLog(logBuffer, false, 'QUARANTINED', name,
+        `${reason} Not owned (owner: ${owner || 'unknown'}) — moved to "${QUARANTINE_FOLDER_NAME}".`);
+    }
+  } catch (e) {
+    pushLog(logBuffer, false, 'FAILED', name, `${reason} Could not remove: ${e.message}`);
+  }
+}
+
+/**
+ * Moves a file/folder into destFolder. Logs the real outcome; returns true on success.
+ */
+function moveInto(item, destFolder, isDryRun, logBuffer, name, actionLabel, note) {
+  if (isDryRun) {
+    pushLog(logBuffer, true, actionLabel, name, note);
+    return true;
+  }
+  try {
+    item.moveTo(destFolder);
+    pushLog(logBuffer, false, actionLabel, name, `${note} (done)`);
+    return true;
+  } catch (e) {
+    pushLog(logBuffer, false, 'FAILED', name, `${note} Move failed: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * Snapshots a Drive iterator into an array. Necessary because moving/trashing items out
+ * of a folder WHILE iterating that folder's live iterator can skip entries.
+ */
+function collect(iterator) {
+  const items = [];
+  while (iterator.hasNext()) items.push(iterator.next());
+  return items;
+}
+
+/**
+ * Compares files and queues subfolders. Each file/folder operation is isolated so one
+ * failure logs a FAILED line and processing continues instead of aborting the folder.
  */
 function processFolderPair(srcId, destId, logBuffer, isDryRun) {
+  const effectiveEmail = Session.getEffectiveUser().getEmail();
   const srcFolder = DriveApp.getFolderById(srcId);
   const destFolder = DriveApp.getFolderById(destId);
   const queuedSubfolders = [];
-  
-  const destFiles = destFolder.getFiles();
+
+  // Map dest files by name, keeping the newest when the dest already has duplicates.
   const destFileMap = {};
-  
-  while (destFiles.hasNext()) {
-    const df = destFiles.next();
+  collect(destFolder.getFiles()).forEach(df => {
     const name = df.getName();
     const lastUpdated = df.getLastUpdated().getTime();
     if (!destFileMap[name] || lastUpdated > destFileMap[name].lastUpdated) {
-      destFileMap[name] = { id: df.getId(), file: df, lastUpdated: lastUpdated };
+      destFileMap[name] = { file: df, lastUpdated: lastUpdated };
     }
-  }
-  
-  const srcFiles = srcFolder.getFiles();
-  while (srcFiles.hasNext()) {
-    const sf = srcFiles.next();
+  });
+
+  // Snapshot source files BEFORE we start moving them out of srcFolder.
+  collect(srcFolder.getFiles()).forEach(sf => {
     const name = sf.getName();
     const srcUpdated = sf.getLastUpdated().getTime();
-    
-    if (destFileMap[name]) {
-      if (srcUpdated > destFileMap[name].lastUpdated) {
-        pushLog(logBuffer, isDryRun, 'REPLACE', name, 'Source is newer. Moving to Dest, trashing older Dest file.');
-        if (!isDryRun) {
-          sf.moveTo(destFolder);
-          destFileMap[name].file.setTrashed(true);
+    const match = destFileMap[name];
+
+    if (match) {
+      if (srcUpdated > match.lastUpdated) {
+        const moved = moveInto(sf, destFolder, isDryRun, logBuffer, name, 'REPLACE', 'Source is newer — moving into Dest.');
+        if (moved) {
+          removeDuplicate(match.file, effectiveEmail, isDryRun, logBuffer, name, 'Older Dest copy.');
         }
       } else {
-        pushLog(logBuffer, isDryRun, 'TRASH SRC', name, 'Dest is newer/equal. Trashing Source.');
-        if (!isDryRun) sf.setTrashed(true);
+        removeDuplicate(sf, effectiveEmail, isDryRun, logBuffer, name, 'Dest is newer/equal — Source is the duplicate.');
       }
     } else {
-      pushLog(logBuffer, isDryRun, 'MOVE FILE', name, 'Moving Source file to Dest.');
-      if (!isDryRun) sf.moveTo(destFolder);
+      moveInto(sf, destFolder, isDryRun, logBuffer, name, 'MOVE FILE', 'New to Dest — moving Source file into Dest.');
     }
-  }
-  
-  const destSubfolders = destFolder.getFolders();
+  });
+
+  // Map dest subfolders by name.
   const destFolderMap = {};
-  while (destSubfolders.hasNext()) {
-    const dfold = destSubfolders.next();
+  collect(destFolder.getFolders()).forEach(dfold => {
     destFolderMap[dfold.getName()] = dfold.getId();
-  }
-  
-  const srcSubfolders = srcFolder.getFolders();
-  while (srcSubfolders.hasNext()) {
-    const sfold = srcSubfolders.next();
+  });
+
+  // Snapshot source subfolders BEFORE we start moving them out of srcFolder.
+  collect(srcFolder.getFolders()).forEach(sfold => {
     const name = sfold.getName();
-    
     if (destFolderMap[name]) {
+      // Both sides have this folder — recurse into the pair.
       queuedSubfolders.push([sfold.getId(), destFolderMap[name]]);
     } else {
-      pushLog(logBuffer, isDryRun, 'MOVE FOLDER', name, 'Moving entire folder to Dest.');
-      if (!isDryRun) sfold.moveTo(destFolder);
+      moveInto(sfold, destFolder, isDryRun, logBuffer, name, 'MOVE FOLDER', 'New to Dest — moving entire folder into Dest.');
     }
-  }
-  
+  });
+
   return queuedSubfolders;
 }
 

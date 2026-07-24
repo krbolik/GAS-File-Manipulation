@@ -7,9 +7,16 @@ tool runs from a custom menu on the bound Google Sheet and defaults to a safe **
 so you can preview every action before anything is moved or trashed.
 
 > ⚠️ Deduplication here is by **filename + last-updated time only** (not by content hash).
-> Same-named files are treated as the same file, and the older one is trashed. In a live
+> Same-named files are treated as the same file, and the older one is removed. In a live
 > run the source folder is emptied as its contents are moved into the destination.
-> Trashed files remain recoverable from Drive Trash.
+>
+> **Ownership matters:** in Google Drive only a file's **owner** can move it to Trash. The
+> script runs as the script owner, who may not own every file in a shared folder. So an
+> older duplicate is either **trashed** (if the script owner owns it — recoverable from
+> Drive Trash) or **quarantined** — moved to a `MERGE_DUPLICATES_TO_REVIEW` folder in the
+> script owner's My Drive — if someone else owns it, so its real owner can delete it. The
+> **Logs** tab records the actual outcome (`TRASHED` / `QUARANTINED` / `MOVED` / `FAILED`)
+> after each action runs, not just the intended one.
 
 ## Container Google Sheet setup
 
@@ -65,7 +72,7 @@ internal worker driven by the two entry points above and by the auto-resume trig
 | Setup | `initializeSheet` | Builds the Settings / Queue / Logs tabs. |
 | Start | `startFreshMerge`, `extractFolderId` | Parses folder URLs/IDs, resets the queue, seeds the root pair. |
 | Process | `processMergeQueue` | Works folder pairs off the Queue under a `LockService` lock within a time budget (4.5 min live; `DRY_RUN_SECONDS` in dry run). |
-| Merge | `processFolderPair` | Per name match: **REPLACE** (source newer → move in, trash old dest), **TRASH SRC** (dest newer/equal → trash source), **MOVE FILE** / **MOVE FOLDER** (new to dest), and queues sub-folder pairs for recursion. |
+| Merge | `processFolderPair` | Per name match: **REPLACE** (source newer → move in, remove old dest), **remove duplicate** (dest newer/equal → remove source), **MOVE FILE** / **MOVE FOLDER** (new to dest), and queues sub-folder pairs for recursion. Each op is isolated (`FAILED` logged on error) and older duplicates are trashed or quarantined by ownership (see `removeDuplicate`). |
 | Resume | `chainExecution`, `cleanupTriggers` | On a live-run timeout, saves the remaining queue and schedules a follow-up trigger ~1 min later; cleans up triggers when done. |
 | Log | `pushLog` | Writes each action to the console and the Logs tab, prefixed `[DRY RUN]` in preview mode. |
 
