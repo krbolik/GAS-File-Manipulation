@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { font-family: -apple-system, sans-serif; font-size: 13px; padding: 15px; background: #f4f7f9; }
+    .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); }
+    #url { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; margin-bottom: 12px; }
+    .btn { background: #007aff; color: white; border: none; padding: 12px; border-radius: 8px; cursor: pointer; width: 100%; font-weight: bold; }
+    .status-area { margin-top: 15px; padding: 12px; background: #eef2f7; border-radius: 8px; border-left: 4px solid #34c759; }
+    .label { font-size: 10px; color: #666; text-transform: uppercase; font-weight: bold; }
+    #parent-txt, #folder-txt, #file-txt { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+    #results { height: 220px; overflow-y: auto; margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; }
+    .dupe-row { padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 11px; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <input type="text" id="url" placeholder="Paste Google Drive URL here...">
+    <button id="mainBtn" class="btn" onclick="startScan()">Analyze Folder</button>
+    
+    <div class="status-area">
+      <div class="label">Parent Folder:</div>
+      <div id="parent-txt">Idle</div>
+      <div class="label" style="margin-top:8px">Scanning Folder:</div>
+      <div id="folder-txt">Idle</div>
+      <div class="label" style="margin-top:8px">Active File:</div>
+      <div id="file-txt">Ready</div>
+    </div>
+
+    <div id="results"></div>
+    <button id="delBtn" class="btn" style="display:none; background:#ff3b30" onclick="confirmDelete()">Move Duplicates to Trash</button>
+  </div>
+
+  <script>
+    let pollInterval;
+    let displayQueue = [];
+    let isUpdating = false;
+    let dupeIds = [];
+
+    async function processQueue() {
+      if (isUpdating || displayQueue.length === 0) return;
+      isUpdating = true;
+      while (displayQueue.length > 0) {
+        const item = displayQueue.shift();
+        document.getElementById('parent-txt').innerText = item.currentParent || "Scanning...";
+        document.getElementById('folder-txt').innerText = item.currentFolder || "...";
+        document.getElementById('file-txt').innerText = item.currentFile || "...";
+        await new Promise(r => setTimeout(r, 800));
+      }
+      isUpdating = false;
+    }
+
+    function startScan() {
+      const url = document.getElementById('url').value;
+      if (!url.startsWith('http')) return alert("Error: Please paste a Google Drive URL.");
+      
+      document.getElementById('results').innerHTML = "Scanning recursively...";
+      
+      pollInterval = setInterval(() => {
+        google.script.run.withSuccessHandler(data => {
+          if (data) { displayQueue.push(data); processQueue(); }
+        }).getLiveStatus();
+      }, 1000);
+
+      google.script.run.withSuccessHandler(handleFinish).processFolder(url);
+    }
+
+    function handleFinish(res) {
+      clearInterval(pollInterval);
+      if (res.error) { alert(res.error); return; }
+      
+      if (res.timeout) {
+        document.getElementById('results').innerHTML = `<b>Timeout reached (${res.count} files scanned).</b><br>Resuming automatically in 3 seconds...`;
+        setTimeout(startScan, 3000);
+        return;
+      }
+
+      const resDiv = document.getElementById('results');
+      if (!res.dupes || res.dupes.length === 0) {
+        resDiv.innerHTML = "<b>Complete! No duplicates found.</b>";
+      } else {
+        dupeIds = res.dupes.map(d => d.duplicate.id);
+        resDiv.innerHTML = `<b>Found ${res.dupes.length} duplicates:</b>`;
+        res.dupes.forEach(p => {
+          const origPath = p.original.fullPath;
+          const dupePath = p.duplicate.fullPath;
+          resDiv.innerHTML += `
+            <div class="dupe-row">
+              🗑️ ${p.duplicate.name}<br>
+              <span style="color:#666">Path: ${dupePath}</span><br>
+              <span style="color:#888">Original in: ${origPath}</span>
+            </div>`;
+        });
+        document.getElementById('delBtn').style.display = "block";
+      }
+    }
+
+    function confirmDelete() {
+      if (confirm(`Move ${dupeIds.length} files to Trash?`)) {
+        google.script.run.withSuccessHandler(() => { alert("Done!"); google.script.host.close(); }).deleteSelectedFiles(dupeIds);
+      }
+    }
+  </script>
+</body>
+</html>

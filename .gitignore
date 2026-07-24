@@ -1,0 +1,14 @@
+# clasp credentials — NEVER commit (contains OAuth tokens)
+.clasprc.json
+**/.clasprc.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+.kilo/
+
+# Local env
+.env
