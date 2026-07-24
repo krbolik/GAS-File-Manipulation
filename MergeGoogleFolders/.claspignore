@@ -1,0 +1,6 @@
+# Only push real Apps Script source (relative to rootDir "src").
+# Ignore everything, then allow-list the files Apps Script needs.
+**/**
+
+!appsscript.json
+!Code.js
