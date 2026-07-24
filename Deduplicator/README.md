@@ -26,6 +26,14 @@ What changed from v4.1:
 Migration note: the first run after upgrading should start with **🚀 Angel → Reset Scan
 Progress** to clear v4's leftover `TEMP_FILE_LIST` / `SCANNED_FOLDERS` properties.
 
+**v5.0.1** — first live run. The scan itself worked (498 files, real md5 hashes, correct
+paths), but clearing a checkpoint sheet threw *"Sorry, it is not possible to delete all
+non-frozen rows."* Appending had grown each sheet's grid to exactly fit its data, so
+`maxRows == getLastRow()` and `deleteRows(2, lastRow - 1)` was asking Sheets to delete
+every non-frozen row. Fixed by clearing with `clearContent` instead of `deleteRows`
+(`clearData`), and by growing the grid explicitly in `appendRows` with 100 rows of
+headroom.
+
 ## How to use
 
 1. Open the bound Google Sheet

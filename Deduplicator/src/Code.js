@@ -54,12 +54,12 @@ function showUi() {
 }
 
 function resetToken() {
-  PropertiesService.getScriptProperties().deleteAllProperties();
-  CacheService.getScriptCache().remove('STATUS');
   [FILES_SHEET, QUEUE_SHEET, DUPES_SHEET].forEach(name => {
     const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
-    if (sh && sh.getLastRow() > 1) sh.deleteRows(2, sh.getLastRow() - 1);
+    if (sh) clearData(sh);
   });
+  PropertiesService.getScriptProperties().deleteAllProperties();
+  CacheService.getScriptCache().remove('STATUS');
   SpreadsheetApp.getUi().alert('Scan progress, checkpoint sheets and cache cleared.');
 }
 
@@ -80,12 +80,28 @@ function getSheet(name, headers) {
 /**
  * Appends rows in one batched write. The range is forced to plain text first so a
  * file literally named "=total.xlsx" is stored as text instead of a formula.
+ * The grid is grown explicitly rather than relying on implicit expansion, which
+ * leaves maxRows exactly equal to the last data row.
  */
 function appendRows(sh, rows) {
   if (!rows.length) return;
-  sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length)
+  const start = sh.getLastRow() + 1;
+  const short = (start + rows.length - 1) - sh.getMaxRows();
+  if (short > 0) sh.insertRowsAfter(sh.getMaxRows(), short + 100);
+  sh.getRange(start, 1, rows.length, rows[0].length)
     .setNumberFormat('@')
     .setValues(rows);
+}
+
+/**
+ * Empties a sheet below its header. Uses clearContent rather than deleteRows:
+ * deleteRows throws "Sorry, it is not possible to delete all non-frozen rows"
+ * whenever maxRows equals the last data row, which is exactly the state an
+ * append-only sheet ends up in.
+ */
+function clearData(sh) {
+  const last = sh.getLastRow();
+  if (last > 1) sh.getRange(2, 1, last - 1, sh.getMaxColumns()).clearContent();
 }
 
 function readColumns(sh, numCols) {
@@ -168,9 +184,7 @@ function startFreshScan(rootId) {
   const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
   const queueSh = getSheet(QUEUE_SHEET, QUEUE_HEADERS);
   const dupesSh = getSheet(DUPES_SHEET, DUPES_HEADERS);
-  [filesSh, queueSh, dupesSh].forEach(sh => {
-    if (sh.getLastRow() > 1) sh.deleteRows(2, sh.getLastRow() - 1);
-  });
+  [filesSh, queueSh, dupesSh].forEach(clearData);
 
   const root = Drive.Files.get(rootId, { fields: 'id,name', supportsAllDrives: true });
   appendRows(queueSh, [[root.id, root.name]]);
@@ -276,7 +290,7 @@ function scanUntilDeadline(deadline) {
 function runDeduplication() {
   const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
   const dupesSh = getSheet(DUPES_SHEET, DUPES_HEADERS);
-  if (dupesSh.getLastRow() > 1) dupesSh.deleteRows(2, dupesSh.getLastRow() - 1);
+  clearData(dupesSh);
 
   const rows = readColumns(filesSh, 5);
   const seen = {};
