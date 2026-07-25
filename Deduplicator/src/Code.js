@@ -1,5 +1,5 @@
 /**
- * Tech Angel Deduplicator v5.2 (Sheet-backed, resumable, interruptible)
+ * Tech Angel Deduplicator v5.4 (Sheet-backed, resumable, interruptible)
  *
  * HOW TO USE:
  *   1. In the bound Google Sheet, open the "🚀 Angel" menu → "Start Deduplicator".
@@ -22,6 +22,12 @@
  * Service, so no file is ever downloaded. Google-native files (Docs/Sheets/Slides)
  * have no md5Checksum and are recorded but excluded from duplicate detection.
  *
+ * WHICH COPY SURVIVES: of a set of byte-identical files, the one with the most recent
+ * date is the original and is kept; every older copy is listed as a duplicate and gets
+ * trashed. The date is Drive's modifiedTime (createdTime when a file has none) — see
+ * DATE_FIELD. Undated files never beat a dated one, and exact ties fall back to scan
+ * order, so the choice is stable every time the list is rebuilt.
+ *
  * REVIEWING: every row of the Duplicates sheet carries a clickable Drive link for
  * the duplicate that would be trashed and for the original it matched, so a pair
  * can be opened and compared straight from the sheet before trashing anything.
@@ -34,27 +40,42 @@ const FILES_SHEET = '_scan_files';
 const QUEUE_SHEET = '_scan_queue';
 const DUPES_SHEET = 'Duplicates';
 
-const FILES_HEADERS = ['File ID', 'Name', 'Size', 'Path', 'Hash'];
+const FILES_HEADERS = ['File ID', 'Name', 'Size', 'Path', 'Hash', 'Date'];
 const QUEUE_HEADERS = ['Folder ID', 'Path'];
-// The duplicate and its original read side by side; the raw ID sits behind them with
-// the other machine-facing columns.
-const DUPES_HEADERS = ['Duplicate Name', 'Duplicate Link', 'Duplicate Path',
-                       'Original Name', 'Original Link', 'Original Path',
+// The duplicate and its original read side by side, each with the date that decided
+// which of them is which; the raw ID sits behind them with the machine-facing columns.
+const DUPES_HEADERS = ['Duplicate Name', 'Duplicate Link', 'Duplicate Path', 'Duplicate Date',
+                       'Original Name', 'Original Link', 'Original Path', 'Original Date',
                        'Size', 'Duplicate ID', 'Hash', 'Status', 'Swap ⇄'];
 
 // 1-based column positions in DUPES_HEADERS, so the layout can change in one place.
 const D_COL_DUPE_NAME = 1;
 const D_COL_DUPE_LINK = 2;
 const D_COL_DUPE_PATH = 3;
-const D_COL_ORIG_NAME = 4;
-const D_COL_ORIG_LINK = 5;
-const D_COL_ORIG_PATH = 6;
-const D_COL_SIZE = 7;
-const D_COL_DUPE_ID = 8;
-const D_COL_HASH = 9;
-const D_COL_STATUS = 10;
-const D_COL_SWAP = 11;
-const D_COL_DATA_WIDTH = 10;         // columns written per row; the swap box is set apart
+const D_COL_DUPE_DATE = 4;
+const D_COL_ORIG_NAME = 5;
+const D_COL_ORIG_LINK = 6;
+const D_COL_ORIG_PATH = 7;
+const D_COL_ORIG_DATE = 8;
+const D_COL_SIZE = 9;
+const D_COL_DUPE_ID = 10;
+const D_COL_HASH = 11;
+const D_COL_STATUS = 12;
+const D_COL_SWAP = 13;
+const D_COL_DATA_WIDTH = 12;         // columns written per row; the swap box is set apart
+
+/**
+ * Which Drive timestamp decides the keeper. modifiedTime is the date Drive itself
+ * shows as "Last modified"; createdTime stands in when a file has no modifiedTime.
+ * Switching this constant needs a fresh scan, since the chosen date is what the scan
+ * records per file.
+ */
+const DATE_FIELD = 'modifiedTime';
+
+const DATE_NOTE = 'The newest copy of a set of identical files is kept as the Original; ' +
+                  'every older copy is listed as a Duplicate and gets trashed. The date ' +
+                  'is Drive\'s "Last modified" (or the creation date when a file has ' +
+                  'none). Tick "Swap ⇄" to overrule the choice on a row.';
 
 const SWAP_NOTE = 'Tick this box to keep the file in this row instead: the Duplicate and ' +
                   'Original sides swap, so the file listed as "Original" becomes the one ' +
@@ -176,17 +197,20 @@ function swapSelectedRows() {
  */
 function swapKeeper(sh, row) {
   const v = sh.getRange(row, 1, 1, D_COL_DATA_WIDTH).getValues()[0];
-  const dupName = v[D_COL_DUPE_NAME - 1], dupUrl = v[D_COL_DUPE_LINK - 1], dupPath = v[D_COL_DUPE_PATH - 1];
-  const origName = v[D_COL_ORIG_NAME - 1], origUrl = v[D_COL_ORIG_LINK - 1], origPath = v[D_COL_ORIG_PATH - 1];
+  const dupe = [v[D_COL_DUPE_NAME - 1], v[D_COL_DUPE_LINK - 1],
+                v[D_COL_DUPE_PATH - 1], v[D_COL_DUPE_DATE - 1]];
+  const orig = [v[D_COL_ORIG_NAME - 1], v[D_COL_ORIG_LINK - 1],
+                v[D_COL_ORIG_PATH - 1], v[D_COL_ORIG_DATE - 1]];
+  const dupUrl = dupe[1], origUrl = orig[1];
   const status = v[D_COL_STATUS - 1];
 
   if (String(status).indexOf('Trashed') === 0) return 'TRASHED';
   const newDupeId = parseFileIdFromUrl(origUrl);
   if (!newDupeId || !dupUrl) return 'SKIP';
 
-  // Columns 1..6 are the duplicate triple followed by the original triple.
-  sh.getRange(row, D_COL_DUPE_NAME, 1, D_COL_ORIG_PATH).setNumberFormat('@')
-    .setValues([[origName, origUrl, origPath, dupName, dupUrl, dupPath]]);
+  // Columns 1..8 are the duplicate's name/link/path/date then the original's.
+  sh.getRange(row, D_COL_DUPE_NAME, 1, D_COL_ORIG_DATE).setNumberFormat('@')
+    .setValues([orig.concat(dupe)]);
   sh.getRange(row, D_COL_DUPE_ID).setNumberFormat('@').setValue(newDupeId);
   linkCell(sh, row, D_COL_DUPE_LINK, origUrl);
   linkCell(sh, row, D_COL_ORIG_LINK, dupUrl);
@@ -459,6 +483,8 @@ function processFolder(inputUrl) {
       }
       startFreshScan(rootId);
       phase = 'SCAN';
+    } else if (phase === 'SCAN') {
+      restartWalkIfRecordsLost();
     }
     clearPause();                       // a stale request must not stop this run at once
 
@@ -500,20 +526,46 @@ function parseFolderId(inputUrl) {
 }
 
 function startFreshScan(rootId) {
-  const props = PropertiesService.getScriptProperties();
   const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
-  const queueSh = getSheet(QUEUE_SHEET, QUEUE_HEADERS);
   const dupesSh = getSheet(DUPES_SHEET, DUPES_HEADERS);
-  [filesSh, queueSh, dupesSh].forEach(clearData);
+  [filesSh, dupesSh].forEach(clearData);
+  const root = seedQueue(rootId);
+  PropertiesService.getScriptProperties().setProperty(P_PHASE, 'SCAN');
+  statusState = {};
+  setStatus({ currentParent: 'Root', currentFolder: root.name, currentFile: 'Starting…', files: 0 }, true);
+}
 
+/** Puts the walk back at the root: one queue entry, cursor 0, no page token. */
+function seedQueue(rootId) {
+  const props = PropertiesService.getScriptProperties();
+  const queueSh = getSheet(QUEUE_SHEET, QUEUE_HEADERS);
+  clearData(queueSh);
   const root = withRetry(() =>
       Drive.Files.get(rootId, { fields: 'id,name', supportsAllDrives: true }));
   appendRows(queueSh, [[root.id, root.name]]);
-  props.setProperties({ [P_ROOT]: rootId, [P_CURSOR]: '0', [P_PHASE]: 'SCAN' });
+  props.setProperties({ [P_ROOT]: rootId, [P_CURSOR]: '0' });
   props.deleteProperty(P_PAGE);
   clearPause();
-  statusState = {};
-  setStatus({ currentParent: 'Root', currentFolder: root.name, currentFile: 'Starting…', files: 0 }, true);
+  return root;
+}
+
+/**
+ * Guards the one inconsistency the checkpoint cannot describe: a cursor deep in the
+ * queue while _scan_files is empty. An upgrade that changes the file record layout
+ * (adding the Date column, say) re-heads that sheet and drops its rows, and resuming
+ * from the old cursor would then skip every folder already walked — silently
+ * under-reporting duplicates. Rewalking the tree is the cheap half of a scan.
+ */
+function restartWalkIfRecordsLost() {
+  const props = PropertiesService.getScriptProperties();
+  const cursor = Number(props.getProperty(P_CURSOR) || 0);
+  const rootId = props.getProperty(P_ROOT);
+  if (!cursor || !rootId) return false;
+  if (getSheet(FILES_SHEET, FILES_HEADERS).getLastRow() > 1) return false;
+
+  seedQueue(rootId);
+  setStatus({ currentFile: 'Scan records were reset by an upgrade — restarting the walk…' }, true);
+  return true;
 }
 
 /**
@@ -578,7 +630,7 @@ function scanUntilDeadline(deadline) {
 
     const params = {
       q: "'" + folderId + "' in parents and trashed = false",
-      fields: 'nextPageToken, files(id,name,mimeType,size,md5Checksum)',
+      fields: 'nextPageToken, files(id,name,mimeType,size,md5Checksum,modifiedTime,createdTime)',
       pageSize: PAGE_SIZE,
       supportsAllDrives: true,
       includeItemsFromAllDrives: true
@@ -613,7 +665,10 @@ function scanUntilDeadline(deadline) {
       seenFiles.add(f.id);
       fileCount++;
       setStatus({ currentFile: f.name, files: fileCount });
-      fileBuf.push([f.id, f.name, Number(f.size || 0), folderPath, f.md5Checksum || '']);
+      // The date is stored as Drive's RFC 3339 string: it sorts correctly as plain
+      // text, which is what the sheet holds, so no parsing is needed to compare.
+      fileBuf.push([f.id, f.name, Number(f.size || 0), folderPath, f.md5Checksum || '',
+                    f[DATE_FIELD] || f.createdTime || '']);
     });
 
     pageToken = res.nextPageToken || null;
@@ -665,36 +720,48 @@ function runDeduplication() {
   }
   dupesSh.setColumnWidth(D_COL_DUPE_LINK, LINK_COL_WIDTH);
   dupesSh.setColumnWidth(D_COL_ORIG_LINK, LINK_COL_WIDTH);
+  dupesSh.setColumnWidth(D_COL_DUPE_DATE, 130);
+  dupesSh.setColumnWidth(D_COL_ORIG_DATE, 130);
   dupesSh.setColumnWidth(D_COL_SWAP, 80);
   dupesSh.getRange(1, D_COL_SWAP).setNote(SWAP_NOTE);
+  dupesSh.getRange(1, D_COL_ORIG_DATE).setNote(DATE_NOTE);
 
-  const rows = readColumns(filesSh, 5);
-  const seen = {};
+  const rows = readColumns(filesSh, FILES_HEADERS.length);
+  const groups = {};
   const dupeRows = [];
-  let skipped = 0, carried = 0, kept = 0;
+  let skipped = 0, carried = 0, kept = 0, undated = 0;
 
-  rows.forEach(r => {
-    const id = r[0], name = r[1], size = r[2], path = r[3], hash = r[4];
+  rows.forEach((r, seq) => {
+    const hash = r[4], size = r[2];
     if (!hash || !size) { skipped++; return; }
+    if (!r[5]) undated++;
     const key = hash + '_' + size;
-    if (!seen[key]) {
-      seen[key] = { id: id, name: name, path: path };
-      return;
-    }
-    let dupe = { id: id, name: name, path: path };
-    let orig = seen[key];
-    // Scan order decides which copy is the original by default. If the sheet already
-    // said otherwise for this exact pair, a reviewer swapped it — keep their decision
-    // instead of quietly re-flipping the row on every re-compare.
-    if (pairChoice[pairKey(dupe.id, orig.id)] === orig.id) {
-      const t = dupe; dupe = orig; orig = t;
-      kept++;
-    }
-    const status = prevStatus[dupe.id] || '';
-    if (status) carried++;
-    dupeRows.push([dupe.name, fileUrl(dupe.id), dupe.path,
-                   orig.name, fileUrl(orig.id), orig.path,
-                   size, dupe.id, hash, status]);
+    (groups[key] = groups[key] || []).push({
+      id: r[0], name: r[1], size: size, path: r[3], hash: hash, date: r[5] || '', seq: seq
+    });
+  });
+
+  Object.keys(groups).forEach(key => {
+    const members = groups[key];
+    if (members.length < 2) return;
+    const keeper = pickKeeper(members);
+
+    members.forEach(m => {
+      if (m === keeper) return;
+      let dupe = m, orig = keeper;
+      // The date rule decides by default. If the sheet already said otherwise for this
+      // exact pair, a reviewer swapped it by hand — keep their decision instead of
+      // quietly re-flipping the row on every re-compare.
+      if (pairChoice[pairKey(dupe.id, orig.id)] === orig.id) {
+        const t = dupe; dupe = orig; orig = t;
+        kept++;
+      }
+      const status = prevStatus[dupe.id] || '';
+      if (status) carried++;
+      dupeRows.push([dupe.name, fileUrl(dupe.id), dupe.path, showDate(dupe.date),
+                     orig.name, fileUrl(orig.id), orig.path, showDate(orig.date),
+                     dupe.size, dupe.id, dupe.hash, status]);
+    });
   });
 
   const start = appendRows(dupesSh, dupeRows);
@@ -711,8 +778,37 @@ function runDeduplication() {
     swapsKept: kept,
     totalFiles: rows.length,
     skipped: skipped,
+    undated: undated,
     sheetUrl: dupesSheetUrl(dupesSh)
   };
+}
+
+/**
+ * The copy a group keeps: the newest one. Dates are Drive's RFC 3339 strings, which
+ * compare correctly as text (fixed-width, UTC, most-significant first).
+ *
+ * A file with no date loses to any dated file rather than winning by accident, and an
+ * exact tie falls back to scan order so the choice is stable across re-compares.
+ */
+function pickKeeper(members) {
+  return members.reduce((best, m) => {
+    if (!m.date) return best;
+    if (!best.date) return m;
+    if (m.date > best.date) return m;
+    if (m.date < best.date) return best;
+    return m.seq < best.seq ? m : best;
+  }, members[0]);
+}
+
+/** Drive's RFC 3339 timestamp as something readable in the sheet's own timezone. */
+function showDate(rfc3339) {
+  if (!rfc3339) return '';
+  try {
+    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    return Utilities.formatDate(new Date(rfc3339), tz, 'yyyy-MM-dd HH:mm');
+  } catch (e) {
+    return String(rfc3339);
+  }
 }
 
 /**

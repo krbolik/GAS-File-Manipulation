@@ -98,6 +98,34 @@ Status carry-over also became layout-independent (`readByHeaders` locates `Dupli
 `Status` by header name), so upgrading past a column change no longer loses the record of
 what was already trashed.
 
+**v5.4** — the newest copy is the original. Of a set of byte-identical files, the one with
+the most recent date is kept and **every older copy is listed for trashing**. Before this,
+"original" simply meant *first seen by the breadth-first walk*, which is an artefact of
+folder order, not a decision.
+
+- The date is Drive's `modifiedTime`, falling back to `createdTime` for a file that has
+  none — the constant `DATE_FIELD` switches which one (a fresh scan is needed after
+  changing it, since the scan is what records the date).
+- The scan now stores that date per file, so `_scan_files` grew a **Date** column and the
+  Duplicates sheet gained **Duplicate Date** / **Original Date** — the rule is only
+  trustworthy if you can see what it decided on.
+- Dates are kept as Drive's RFC 3339 strings, which sort correctly as plain text, so no
+  parsing is needed to compare them; the sheet shows them formatted in the spreadsheet's
+  own timezone.
+- An undated file never wins over a dated one, and exact ties fall back to scan order, so
+  rebuilding the list twice always picks the same keeper.
+- Comparison is now grouped rather than streamed: all copies of one hash are collected,
+  the keeper is chosen, and the rest become rows against it — so duplicates of the same
+  file sit together in the sheet. Manual **Swap ⇄** decisions still overrule the rule and
+  still survive a re-compare.
+
+Because the file record layout changed, `_scan_files` is re-headed (and emptied) on the
+first run of this version. `restartWalkIfRecordsLost` catches the state that would
+otherwise cause — a queue cursor deep in the tree with no file records behind it, which
+would silently skip every folder already walked — and restarts the walk from the root.
+**A scan in progress when you upgrade therefore starts over**; a finished one just needs
+running again to pick up dates.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -125,8 +153,10 @@ what was already trashed.
    compare is available without the dialog via **🚀 Angel → Compare Files Scanned So Far**.
 8. To discard a paused or stale scan and start clean: **🚀 Angel → Reset Scan Progress**.
 
-> The tool only ever trashes the **duplicate** copy (the first file seen for each
-> content hash is kept as the original). Trashed files stay recoverable from Drive Trash.
+> **The newest copy is the one that survives.** For each set of byte-identical files the
+> most recently modified copy is kept as the original and every older copy is trashed —
+> both dates are in the sheet, and **Swap ⇄** overrules the choice per row. Trashed files
+> stay recoverable from Drive Trash.
 
 ## How it works (complete flow)
 
@@ -137,7 +167,7 @@ what was already trashed.
 | Hash | (none — Drive supplies it) | Uses Drive's own `md5Checksum` field. **No file is ever downloaded**, so there is no size limit and no `LARGE_<size>` fallback. |
 | Resume | `processFolder` (timeout branch) | On the 4.5-min soft limit the buffers are flushed, the queue cursor + page token are saved, and `{timeout:true}` is returned; the dialog re-invokes to continue. Resume is O(1) — no re-walking the tree. |
 | Pause | `requestPause`, `scanUntilDeadline` | A cache flag polled ~every 2 s by the walk. It flushes and returns `'PAUSED'` at a folder boundary, so partial results can be compared and trashed mid-scan. |
-| Detect | `runDeduplication` | Groups `_scan_files` by `md5 + size`; the first is the original, later matches go to the **Duplicates** sheet. Runnable at any time via `compareScannedSoFar`; carries over the Status of rows already handled. |
+| Detect | `runDeduplication`, `pickKeeper` | Groups `_scan_files` by `md5 + size`; the newest copy of each group is the original, every older one becomes a row in the **Duplicates** sheet. Runnable at any time via `compareScannedSoFar`; carries over the Status of rows already handled and any manual swaps. |
 | Report | `getLiveStatus`, `getState`, `Progress.html` | Live status is throttled into `CacheService` (~1 write / 2 s) and polled by the dialog; `getState` lets a reopened dialog resume and re-offer the trash button. |
 | Delete | `trashDuplicates` | Trashes every un-handled row of the Duplicates sheet, writing `Trashed` / `Error: …` into the Status column in batches of 50. Resumes across the 6-min limit like the scan. |
 | Swap | `onEdit`, `swapKeeper`, `swapSelectedRows` | The **Swap ⇄** checkbox flips one row's Duplicate and Original sides and clears itself; the new duplicate ID is parsed out of the Original Link. Nothing in Drive moves — only which ID `trashDuplicates` will read. |
@@ -152,9 +182,9 @@ two cross-execution signals — the live status (`STATUS`) and the pause request
 
 | Sheet | Columns | Role |
 |-------|---------|------|
-| `_scan_files` | File ID, Name, Size, Path, Hash | append-only record of every file seen |
+| `_scan_files` | File ID, Name, Size, Path, Hash, Date | append-only record of every file seen |
 | `_scan_queue` | Folder ID, Path | the folder frontier + a cursor into it |
-| `Duplicates` | Duplicate Name/Link/Path, Original Name/Link/Path, Size, Duplicate ID, Hash, Status, Swap ⇄ | the reviewable result |
+| `Duplicates` | Duplicate Name/Link/Path/Date, Original Name/Link/Path/Date, Size, Duplicate ID, Hash, Status, Swap ⇄ | the reviewable result |
 
 > **Why not `ScriptProperties`?** A single property value is capped at **9 KB** — about
 > 40 file records. v4 checkpointed the whole file list into one property, so every scan
