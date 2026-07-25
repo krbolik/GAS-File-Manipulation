@@ -283,7 +283,9 @@
       if (res.dupeCount) {
         html += '<br><br>Full list in the <a href="' + res.sheetUrl + '" target="_blank"><b>Duplicates</b></a> ' +
                 'sheet — every row links to the duplicate and to the original in Drive. Delete any row you ' +
-                'want to keep, then trash the rest.';
+                'want to keep untouched, tick <b>Swap ⇄</b> on a row to keep that copy and trash the ' +
+                'original instead, then trash the rest.' +
+                (res.swapsKept ? '<br><span class="note">' + res.swapsKept + ' earlier swap(s) kept.</span>' : '');
       }
       if (isPartial) {
         html += '<br><span class="note">These duplicates can be trashed right now; click <b>Resume Scan</b> ' +

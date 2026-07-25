@@ -70,6 +70,34 @@ things changed:
   unhandled rows, however the scan that produced them ended. The soft deadline moved to
   4.5 min for more headroom under the 6-min kill.
 
+**v5.3** — per-row swap, and the ID column out of the way. The Duplicates sheet now reads
+`Duplicate Name · Duplicate Link · Duplicate Path · Original Name · Original Link ·
+Original Path · Size · Duplicate ID · Hash · Status · Swap ⇄` — the two sides side by side,
+with the raw ID moved back among the machine-facing columns.
+
+**Swap ⇄** is a checkbox per row that behaves like a button: tick it and the Duplicate and
+Original sides of that row trade places, so the copy shown as the duplicate is the one that
+survives and the file that was the original gets trashed instead. The box clears itself
+immediately (via the `onEdit` simple trigger), a toast confirms what happened, and rows
+already marked `Trashed` refuse to swap — the file is in the bin, so the row would describe
+something that no longer exists. **🚀 Angel → Keep Duplicate Instead (selected rows)** does the
+same for a whole selection.
+
+Two details worth knowing:
+
+- The new duplicate ID is parsed back out of the **Original Link**, which is the reason that
+  column holds a full URL rather than link text — the two sides stay swappable without a
+  second hidden ID column.
+- A re-compare **remembers swaps**. `readPairChoices` records which of the two files each
+  pair currently calls the duplicate; when `runDeduplication` rebuilds the list and its own
+  scan-order default disagrees, the reviewer's choice wins instead of being silently flipped
+  back. Whatever is swapped, each content-identical group keeps at least one copy: *n* copies
+  produce *n−1* rows, so at most *n−1* distinct files can ever be trashed.
+
+Status carry-over also became layout-independent (`readByHeaders` locates `Duplicate ID` and
+`Status` by header name), so upgrading past a column change no longer loses the record of
+what was already trashed.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -85,8 +113,9 @@ things changed:
    the Apps Script 6-minute limit it **pauses and auto-resumes** until the whole tree is
    covered — no action needed.
 5. When the scan finishes, the full duplicate list is written to the **Duplicates** sheet.
-   Review it there — **delete any row you want to keep** — then click **Move Duplicates
-   to Trash** in the dialog and confirm.
+   Review it there — **delete any row you want left alone**, and tick **Swap ⇄** on a row to
+   keep *that* copy and trash the original instead — then click **Move Duplicates to Trash**
+   in the dialog and confirm.
 6. **Don't want to wait for the whole tree?** Click **Pause & Compare What Is Scanned So Far**
    at any time. The walk stops at the next folder, the files seen so far are compared, and the
    duplicates among them can be trashed right away. **Resume Scan** continues where it stopped;
@@ -111,6 +140,7 @@ things changed:
 | Detect | `runDeduplication` | Groups `_scan_files` by `md5 + size`; the first is the original, later matches go to the **Duplicates** sheet. Runnable at any time via `compareScannedSoFar`; carries over the Status of rows already handled. |
 | Report | `getLiveStatus`, `getState`, `Progress.html` | Live status is throttled into `CacheService` (~1 write / 2 s) and polled by the dialog; `getState` lets a reopened dialog resume and re-offer the trash button. |
 | Delete | `trashDuplicates` | Trashes every un-handled row of the Duplicates sheet, writing `Trashed` / `Error: …` into the Status column in batches of 50. Resumes across the 6-min limit like the scan. |
+| Swap | `onEdit`, `swapKeeper`, `swapSelectedRows` | The **Swap ⇄** checkbox flips one row's Duplicate and Original sides and clears itself; the new duplicate ID is parsed out of the Original Link. Nothing in Drive moves — only which ID `trashDuplicates` will read. |
 | Recover | `withRetry`, `describeError`, `isSkippableFolderError` | Transient Drive/Sheets errors are retried with backoff, unreadable folders are skipped, and every failure reaches the dialog as a message it can retry from. |
 
 ## State storage
@@ -124,7 +154,7 @@ two cross-execution signals — the live status (`STATUS`) and the pause request
 |-------|---------|------|
 | `_scan_files` | File ID, Name, Size, Path, Hash | append-only record of every file seen |
 | `_scan_queue` | Folder ID, Path | the folder frontier + a cursor into it |
-| `Duplicates` | Duplicate Name/Link/Path/ID, Original Name/Link/Path, Size, Hash, Status | the reviewable result |
+| `Duplicates` | Duplicate Name/Link/Path, Original Name/Link/Path, Size, Duplicate ID, Hash, Status, Swap ⇄ | the reviewable result |
 
 > **Why not `ScriptProperties`?** A single property value is capped at **9 KB** — about
 > 40 file records. v4 checkpointed the whole file list into one property, so every scan

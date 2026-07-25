@@ -25,6 +25,9 @@
  * REVIEWING: every row of the Duplicates sheet carries a clickable Drive link for
  * the duplicate that would be trashed and for the original it matched, so a pair
  * can be opened and compared straight from the sheet before trashing anything.
+ * Ticking the row's "Swap ⇄" box flips the two sides — the copy shown as the
+ * duplicate is kept and the original is trashed instead — and the box clears itself,
+ * so it acts like a per-row button. A later re-compare remembers the flip.
  */
 
 const FILES_SHEET = '_scan_files';
@@ -33,15 +36,31 @@ const DUPES_SHEET = 'Duplicates';
 
 const FILES_HEADERS = ['File ID', 'Name', 'Size', 'Path', 'Hash'];
 const QUEUE_HEADERS = ['Folder ID', 'Path'];
-const DUPES_HEADERS = ['Duplicate Name', 'Duplicate Link', 'Duplicate Path', 'Duplicate ID',
+// The duplicate and its original read side by side; the raw ID sits behind them with
+// the other machine-facing columns.
+const DUPES_HEADERS = ['Duplicate Name', 'Duplicate Link', 'Duplicate Path',
                        'Original Name', 'Original Link', 'Original Path',
-                       'Size', 'Hash', 'Status'];
+                       'Size', 'Duplicate ID', 'Hash', 'Status', 'Swap ⇄'];
 
 // 1-based column positions in DUPES_HEADERS, so the layout can change in one place.
+const D_COL_DUPE_NAME = 1;
 const D_COL_DUPE_LINK = 2;
-const D_COL_DUPE_ID = 4;
-const D_COL_ORIG_LINK = 6;
+const D_COL_DUPE_PATH = 3;
+const D_COL_ORIG_NAME = 4;
+const D_COL_ORIG_LINK = 5;
+const D_COL_ORIG_PATH = 6;
+const D_COL_SIZE = 7;
+const D_COL_DUPE_ID = 8;
+const D_COL_HASH = 9;
 const D_COL_STATUS = 10;
+const D_COL_SWAP = 11;
+const D_COL_DATA_WIDTH = 10;         // columns written per row; the swap box is set apart
+
+const SWAP_NOTE = 'Tick this box to keep the file in this row instead: the Duplicate and ' +
+                  'Original sides swap, so the file listed as "Original" becomes the one ' +
+                  'that gets trashed. Tick again to swap back. Rows already trashed cannot ' +
+                  'be swapped.';
+
 const LINK_COL_WIDTH = 320;
 const LINK_CHUNK = 500;              // rich-text rows per write, keeps payloads small
 
@@ -68,8 +87,112 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu('🚀 Angel')
       .addItem('Start Deduplicator', 'showUi')
       .addItem('Compare Files Scanned So Far', 'compareScannedSoFarMenu')
+      .addItem('Keep Duplicate Instead (selected rows)', 'swapSelectedRows')
       .addItem('Reset Scan Progress', 'resetToken')
       .addToUi();
+}
+
+/* --------------------------------------------------------------------- swap -- */
+
+/**
+ * The per-row switch in the "Swap ⇄" column. Ticking the box swaps the Duplicate and
+ * Original sides of that row, so the copy shown as the duplicate is the one that
+ * survives and the file that was the original gets trashed instead. The box clears
+ * itself again, which makes it behave like a button rather than a stored setting.
+ *
+ * This is a simple trigger, so it may only touch the spreadsheet — that is all a swap
+ * needs. Nothing in Drive moves; the row just changes which ID trashDuplicates reads.
+ */
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    const sh = e.range.getSheet();
+    if (sh.getName() !== DUPES_SHEET) return;
+    if (e.range.getColumn() !== D_COL_SWAP || e.range.getNumColumns() !== 1) return;
+
+    const first = e.range.getRow();
+    const ticks = e.range.getValues();
+    let swapped = 0, blocked = 0, bad = 0;
+
+    for (let i = 0; i < ticks.length; i++) {
+      const row = first + i;
+      if (row < 2 || ticks[i][0] !== true) continue;
+      const outcome = swapKeeper(sh, row);
+      if (outcome === 'OK') swapped++;
+      else if (outcome === 'TRASHED') blocked++;
+      else bad++;
+    }
+
+    // Clear the boxes we just acted on — a programmatic write does not re-trigger onEdit.
+    e.range.setValues(ticks.map(() => [false]));
+
+    if (swapped || blocked || bad) {
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        (swapped ? swapped + ' row(s) swapped — the file now shown as "Original" will be trashed. ' : '') +
+        (blocked ? blocked + ' row(s) left alone (already trashed). ' : '') +
+        (bad ? bad + ' row(s) could not be read. ' : ''),
+        'Swap ⇄', 6);
+    }
+  } catch (err) {
+    // A simple trigger has nowhere to report to; a toast is the most it can do.
+    try { SpreadsheetApp.getActiveSpreadsheet().toast(describeError(err), 'Swap failed', 8); } catch (ignored) {}
+  }
+}
+
+/**
+ * Menu twin of the checkbox, for the whole current selection. Useful for flipping many
+ * rows at once, and as a fallback if the simple trigger is ever unavailable.
+ */
+function swapSelectedRows() {
+  const ui = SpreadsheetApp.getUi();
+  const sh = SpreadsheetApp.getActiveSheet();
+  if (sh.getName() !== DUPES_SHEET) {
+    return ui.alert('Select the rows to swap in the "' + DUPES_SHEET + '" sheet first.');
+  }
+  const sel = sh.getActiveRange();
+  const first = Math.max(2, sel.getRow());
+  // Clamp to real data, so selecting whole columns does not "skip" a thousand blanks.
+  const last = Math.min(sel.getRow() + sel.getNumRows() - 1, sh.getLastRow());
+  let swapped = 0, blocked = 0, bad = 0;
+  for (let row = first; row <= last; row++) {
+    const outcome = swapKeeper(sh, row);
+    if (outcome === 'OK') swapped++;
+    else if (outcome === 'TRASHED') blocked++;
+    else bad++;
+  }
+  ui.alert(swapped + ' row(s) swapped: the file listed as "Original" is now the one that ' +
+           'will be trashed.' +
+           (blocked ? '\n' + blocked + ' row(s) skipped — already trashed.' : '') +
+           (bad ? '\n' + bad + ' row(s) skipped — no usable links in the row.' : ''));
+}
+
+/**
+ * Swaps the Duplicate and Original sides of one row and repoints Duplicate ID at the
+ * new duplicate. The ID comes out of the Original Link, which is why that column holds
+ * a full Drive URL: the two sides stay swappable without a second hidden ID column.
+ *
+ * Returns 'OK', 'TRASHED' (the duplicate is already in the bin, so swapping would
+ * describe something that no longer exists) or 'SKIP'.
+ */
+function swapKeeper(sh, row) {
+  const v = sh.getRange(row, 1, 1, D_COL_DATA_WIDTH).getValues()[0];
+  const dupName = v[D_COL_DUPE_NAME - 1], dupUrl = v[D_COL_DUPE_LINK - 1], dupPath = v[D_COL_DUPE_PATH - 1];
+  const origName = v[D_COL_ORIG_NAME - 1], origUrl = v[D_COL_ORIG_LINK - 1], origPath = v[D_COL_ORIG_PATH - 1];
+  const status = v[D_COL_STATUS - 1];
+
+  if (String(status).indexOf('Trashed') === 0) return 'TRASHED';
+  const newDupeId = parseFileIdFromUrl(origUrl);
+  if (!newDupeId || !dupUrl) return 'SKIP';
+
+  // Columns 1..6 are the duplicate triple followed by the original triple.
+  sh.getRange(row, D_COL_DUPE_NAME, 1, D_COL_ORIG_PATH).setNumberFormat('@')
+    .setValues([[origName, origUrl, origPath, dupName, dupUrl, dupPath]]);
+  sh.getRange(row, D_COL_DUPE_ID).setNumberFormat('@').setValue(newDupeId);
+  linkCell(sh, row, D_COL_DUPE_LINK, origUrl);
+  linkCell(sh, row, D_COL_ORIG_LINK, dupUrl);
+  // A failed attempt on the old file says nothing about the new one, so let it be retried.
+  if (status) sh.getRange(row, D_COL_STATUS).clearContent();
+  return 'OK';
 }
 
 /**
@@ -234,6 +357,24 @@ function appendRows(sh, rows) {
 
 function fileUrl(id) {
   return 'https://drive.google.com/file/d/' + id + '/view';
+}
+
+/**
+ * Inverse of fileUrl, and tolerant of the other shapes a pasted Drive URL takes.
+ * The id is taken as "everything up to the next separator" rather than by matching a
+ * length or character class, so nothing here depends on how Drive happens to mint ids.
+ */
+function parseFileIdFromUrl(url) {
+  const s = String(url || '');
+  let m = s.match(/\/d\/([^/?#]+)/);               // .../file/d/<id>/view
+  if (!m) m = s.match(/[?&]id=([^&#]+)/);          // ...open?id=<id>
+  return m ? m[1] : '';
+}
+
+/** One cell's worth of linkifyColumn, for the swap. */
+function linkCell(sh, row, col, url) {
+  sh.getRange(row, col).setNumberFormat('@').setRichTextValue(
+      SpreadsheetApp.newRichTextValue().setText(url).setLinkUrl(url).build());
 }
 
 /**
@@ -512,37 +653,54 @@ function isSkippableFolderError(e) {
  * neither lost nor repeated when the finished scan is compared again.
  */
 function runDeduplication() {
+  const prevStatus = readStatusByFileId();          // before getSheet may re-head the sheet
+  const pairChoice = readPairChoices();             // and before the rows are rewritten
   const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
   const dupesSh = getSheet(DUPES_SHEET, DUPES_HEADERS);
-  const prevStatus = readStatusByFileId(dupesSh);
   clearData(dupesSh);
+  // clearContent leaves the checkbox validation behind; a shorter list than last time
+  // would otherwise trail empty boxes that look like rows waiting to be acted on.
+  if (dupesSh.getMaxRows() > 1) {
+    dupesSh.getRange(2, D_COL_SWAP, dupesSh.getMaxRows() - 1, 1).clearDataValidations();
+  }
   dupesSh.setColumnWidth(D_COL_DUPE_LINK, LINK_COL_WIDTH);
   dupesSh.setColumnWidth(D_COL_ORIG_LINK, LINK_COL_WIDTH);
+  dupesSh.setColumnWidth(D_COL_SWAP, 80);
+  dupesSh.getRange(1, D_COL_SWAP).setNote(SWAP_NOTE);
 
   const rows = readColumns(filesSh, 5);
   const seen = {};
   const dupeRows = [];
-  let skipped = 0, carried = 0;
+  let skipped = 0, carried = 0, kept = 0;
 
   rows.forEach(r => {
     const id = r[0], name = r[1], size = r[2], path = r[3], hash = r[4];
     if (!hash || !size) { skipped++; return; }
     const key = hash + '_' + size;
-    if (seen[key]) {
-      const orig = seen[key];
-      const status = prevStatus[id] || '';
-      if (status) carried++;
-      dupeRows.push([name, fileUrl(id), path, id,
-                     orig.name, fileUrl(orig.id), orig.path,
-                     size, hash, status]);
-    } else {
+    if (!seen[key]) {
       seen[key] = { id: id, name: name, path: path };
+      return;
     }
+    let dupe = { id: id, name: name, path: path };
+    let orig = seen[key];
+    // Scan order decides which copy is the original by default. If the sheet already
+    // said otherwise for this exact pair, a reviewer swapped it — keep their decision
+    // instead of quietly re-flipping the row on every re-compare.
+    if (pairChoice[pairKey(dupe.id, orig.id)] === orig.id) {
+      const t = dupe; dupe = orig; orig = t;
+      kept++;
+    }
+    const status = prevStatus[dupe.id] || '';
+    if (status) carried++;
+    dupeRows.push([dupe.name, fileUrl(dupe.id), dupe.path,
+                   orig.name, fileUrl(orig.id), orig.path,
+                   size, dupe.id, hash, status]);
   });
 
   const start = appendRows(dupesSh, dupeRows);
   linkifyColumn(dupesSh, start, D_COL_DUPE_LINK, dupeRows.map(r => r[D_COL_DUPE_LINK - 1]));
   linkifyColumn(dupesSh, start, D_COL_ORIG_LINK, dupeRows.map(r => r[D_COL_ORIG_LINK - 1]));
+  if (start) dupesSh.getRange(start, D_COL_SWAP, dupeRows.length, 1).insertCheckboxes();
   setStatus({ currentFile: 'Compared — ' + dupeRows.length + ' duplicates', files: rows.length }, true);
 
   return {
@@ -550,23 +708,62 @@ function runDeduplication() {
     dupeCount: dupeRows.length,
     pending: dupeRows.length - carried,
     alreadyHandled: carried,
+    swapsKept: kept,
     totalFiles: rows.length,
     skipped: skipped,
     sheetUrl: dupesSheetUrl(dupesSh)
   };
 }
 
-/** Duplicate-file-ID → Status, read from the Duplicates sheet before it is rewritten. */
-function readStatusByFileId(dupesSh) {
-  const n = dupesSh.getLastRow() - 1;
+/**
+ * Duplicate-file-ID → Status from the Duplicates sheet as it stands now, located by
+ * header name rather than by column number: this runs before a possible layout
+ * migration, so the sheet may still be in an older column order. Losing the map would
+ * mean re-trashing files that are already in the bin, so it is worth the header lookup.
+ */
+function readStatusByFileId() {
   const map = {};
-  if (n < 1) return map;
-  const ids = dupesSh.getRange(2, D_COL_DUPE_ID, n, 1).getValues();
-  const stats = dupesSh.getRange(2, D_COL_STATUS, n, 1).getValues();
-  for (let i = 0; i < n; i++) {
-    if (ids[i][0] && stats[i][0]) map[ids[i][0]] = stats[i][0];
-  }
+  const cells = readByHeaders(['Duplicate ID', 'Status']);
+  cells.forEach(c => { if (c[0] && c[1]) map[c[0]] = c[1]; });
   return map;
+}
+
+/**
+ * For every duplicate/original pair currently on the sheet: which of the two the sheet
+ * calls the duplicate. runDeduplication compares that against its own default to tell a
+ * reviewer's swap apart from an untouched row.
+ */
+function readPairChoices() {
+  const out = {};
+  readByHeaders(['Duplicate ID', 'Original Link']).forEach(c => {
+    const dupeId = c[0], origId = parseFileIdFromUrl(c[1]);
+    if (dupeId && origId) out[pairKey(dupeId, origId)] = dupeId;
+  });
+  return out;
+}
+
+/** Unordered key for a duplicate/original pair, so it survives being flipped. */
+function pairKey(a, b) {
+  return a < b ? a + '|' + b : b + '|' + a;
+}
+
+/**
+ * Reads named columns out of the Duplicates sheet whatever order they sit in, returning
+ * one array per row in the order the names were asked for. Missing headers yield [].
+ */
+function readByHeaders(names) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DUPES_SHEET);
+  if (!sh) return [];
+  const n = sh.getLastRow() - 1;
+  const width = sh.getLastColumn();
+  if (n < 1 || width < 1) return [];
+
+  const header = sh.getRange(1, 1, 1, width).getValues()[0];
+  const idx = names.map(name => header.indexOf(name));
+  if (idx.some(i => i < 0)) return [];
+
+  const rows = sh.getRange(2, 1, n, width).getValues();
+  return rows.map(r => idx.map(i => r[i]));
 }
 
 function dupesSheetUrl(dupesSh) {
@@ -682,7 +879,7 @@ function trashDuplicates() {
 
   try {
     const deadline = Date.now() + MAX_RUNTIME;
-    rows = readColumns(sh, DUPES_HEADERS.length);
+    rows = readColumns(sh, D_COL_DATA_WIDTH);      // the swap checkbox is not needed here
 
     for (let i = 0; i < rows.length; i++) {
       const done = rows[i][D_COL_STATUS - 1];
