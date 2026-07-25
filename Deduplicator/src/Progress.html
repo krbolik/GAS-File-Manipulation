@@ -104,7 +104,8 @@
         '<span class="note">' + res.skipped + ' files skipped (Google-native or empty — these are ' +
         'never reported as duplicates).</span><br><br>' +
         'The full list is in the <a href="' + res.sheetUrl + '" target="_blank"><b>Duplicates</b></a> sheet. ' +
-        'Review it there, delete any row you want to keep, then trash the rest.';
+        'Every row links straight to the duplicate and to the original in Drive — check them there, ' +
+        'delete any row you want to keep, then trash the rest.';
       window.dupeCount = res.dupeCount;
       document.getElementById('delBtn').style.display = 'block';
     }

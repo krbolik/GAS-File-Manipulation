@@ -15,6 +15,10 @@
  * HASHING: file hashes come from Drive's own md5Checksum via the Advanced Drive
  * Service, so no file is ever downloaded. Google-native files (Docs/Sheets/Slides)
  * have no md5Checksum and are recorded but excluded from duplicate detection.
+ *
+ * REVIEWING: every row of the Duplicates sheet carries a clickable Drive link for
+ * the duplicate that would be trashed and for the original it matched, so a pair
+ * can be opened and compared straight from the sheet before trashing anything.
  */
 
 const FILES_SHEET = '_scan_files';
@@ -23,8 +27,17 @@ const DUPES_SHEET = 'Duplicates';
 
 const FILES_HEADERS = ['File ID', 'Name', 'Size', 'Path', 'Hash'];
 const QUEUE_HEADERS = ['Folder ID', 'Path'];
-const DUPES_HEADERS = ['Duplicate Name', 'Duplicate Path', 'Duplicate ID',
-                       'Original Name', 'Original Path', 'Size', 'Hash', 'Status'];
+const DUPES_HEADERS = ['Duplicate Name', 'Duplicate Link', 'Duplicate Path', 'Duplicate ID',
+                       'Original Name', 'Original Link', 'Original Path',
+                       'Size', 'Hash', 'Status'];
+
+// 1-based column positions in DUPES_HEADERS, so the layout can change in one place.
+const D_COL_DUPE_LINK = 2;
+const D_COL_DUPE_ID = 4;
+const D_COL_ORIG_LINK = 6;
+const D_COL_STATUS = 10;
+const LINK_COL_WIDTH = 320;
+const LINK_CHUNK = 500;              // rich-text rows per write, keeps payloads small
 
 const MAX_RUNTIME = 5 * 60 * 1000;   // soft deadline; hard kill is at 6 min
 const FLUSH_EVERY = 200;             // rows buffered before a batched sheet write
@@ -73,24 +86,76 @@ function getSheet(name, headers) {
     sh.appendRow(headers);
     sh.setFrozenRows(1);
     sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    return sh;
   }
+  writeHeaders(sh, headers);
   return sh;
 }
 
 /**
- * Appends rows in one batched write. The range is forced to plain text first so a
- * file literally named "=total.xlsx" is stored as text instead of a formula.
- * The grid is grown explicitly rather than relying on implicit expansion, which
- * leaves maxRows exactly equal to the last data row.
+ * Rewrites the header row when it does not match `headers` — the state a sheet left
+ * behind by an older version is in. Without this, a Duplicates sheet created before
+ * the link columns existed would keep its 8 old headers while rows are written 10
+ * columns wide, silently mislabelling every column. Its rows are dropped too, since
+ * they no longer line up with the new layout.
+ *
+ * Only the first `headers.length` columns are compared, so columns a reviewer added
+ * to the right of the layout never trigger a migration (and never cost them a
+ * half-finished trash run).
+ */
+function writeHeaders(sh, headers) {
+  const missing = headers.length - sh.getMaxColumns();
+  if (missing > 0) sh.insertColumnsAfter(sh.getMaxColumns(), missing);
+
+  const current = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+  if (headers.every((h, i) => current[i] === h)) return;
+
+  clearData(sh);
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+}
+
+/**
+ * Appends rows in one batched write and returns the row the block starts at (0 when
+ * nothing was written). The range is forced to plain text first so a file literally
+ * named "=total.xlsx" is stored as text instead of a formula. The grid is grown
+ * explicitly rather than relying on implicit expansion, which leaves maxRows exactly
+ * equal to the last data row.
  */
 function appendRows(sh, rows) {
-  if (!rows.length) return;
+  if (!rows.length) return 0;
   const start = sh.getLastRow() + 1;
   const short = (start + rows.length - 1) - sh.getMaxRows();
   if (short > 0) sh.insertRowsAfter(sh.getMaxRows(), short + 100);
   sh.getRange(start, 1, rows.length, rows[0].length)
     .setNumberFormat('@')
     .setValues(rows);
+  return start;
+}
+
+/* ------------------------------------------------------------------- links -- */
+
+function fileUrl(id) {
+  return 'https://drive.google.com/file/d/' + id + '/view';
+}
+
+/**
+ * Turns a column of already-written URL text into clickable links.
+ *
+ * Rich text is used rather than a `=HYPERLINK()` formula because appendRows forces
+ * the range to plain-text format (the "=total.xlsx" guard), which would store any
+ * formula as literal text. Rich-text links are also unaffected by that format, and
+ * getValues() still returns the plain URL string — so reading the sheet back, e.g.
+ * in trashDuplicates, behaves exactly as before.
+ */
+function linkifyColumn(sh, startRow, col, urls) {
+  if (!startRow || !urls.length) return;
+  for (let i = 0; i < urls.length; i += LINK_CHUNK) {
+    const values = urls.slice(i, i + LINK_CHUNK).map(u => [
+      SpreadsheetApp.newRichTextValue().setText(u).setLinkUrl(u).build()
+    ]);
+    sh.getRange(startRow + i, col, values.length, 1).setRichTextValues(values);
+  }
 }
 
 /**
@@ -286,11 +351,16 @@ function scanUntilDeadline(deadline) {
  * Groups the scanned files by md5 + size and writes every later match to the
  * Duplicates sheet. Files without a hash (Google-native) and zero-byte files are
  * never reported — neither can be compared safely by content.
+ *
+ * Both the duplicate (the copy that would be trashed) and the original it matched
+ * get a clickable Drive link, so a row can be checked without hunting for the file.
  */
 function runDeduplication() {
   const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
   const dupesSh = getSheet(DUPES_SHEET, DUPES_HEADERS);
   clearData(dupesSh);
+  dupesSh.setColumnWidth(D_COL_DUPE_LINK, LINK_COL_WIDTH);
+  dupesSh.setColumnWidth(D_COL_ORIG_LINK, LINK_COL_WIDTH);
 
   const rows = readColumns(filesSh, 5);
   const seen = {};
@@ -303,13 +373,17 @@ function runDeduplication() {
     const key = hash + '_' + size;
     if (seen[key]) {
       const orig = seen[key];
-      dupeRows.push([name, path, id, orig.name, orig.path, size, hash, '']);
+      dupeRows.push([name, fileUrl(id), path, id,
+                     orig.name, fileUrl(orig.id), orig.path,
+                     size, hash, '']);
     } else {
       seen[key] = { id: id, name: name, path: path };
     }
   });
 
-  appendRows(dupesSh, dupeRows);
+  const start = appendRows(dupesSh, dupeRows);
+  linkifyColumn(dupesSh, start, D_COL_DUPE_LINK, dupeRows.map(r => r[D_COL_DUPE_LINK - 1]));
+  linkifyColumn(dupesSh, start, D_COL_ORIG_LINK, dupeRows.map(r => r[D_COL_ORIG_LINK - 1]));
   setStatus({ currentFile: 'Done — ' + dupeRows.length + ' duplicates', files: rows.length }, true);
 
   return {
@@ -337,18 +411,18 @@ function trashDuplicates() {
     let trashed = 0, errors = 0, remaining = 0;
 
     for (let i = 0; i < rows.length; i++) {
-      if (rows[i][7]) continue;                                // already handled
+      if (rows[i][D_COL_STATUS - 1]) continue;                 // already handled
       if (Date.now() > deadline) { remaining = rows.length - i; break; }
       let status;
       try {
-        DriveApp.getFileById(rows[i][2]).setTrashed(true);
+        DriveApp.getFileById(rows[i][D_COL_DUPE_ID - 1]).setTrashed(true);
         status = 'Trashed';
         trashed++;
       } catch (e) {
         status = 'Error: ' + e.message;
         errors++;
       }
-      sh.getRange(i + 2, 8).setValue(status);
+      sh.getRange(i + 2, D_COL_STATUS).setValue(status);
       setStatus({ currentFile: 'Trashing: ' + rows[i][0] });
     }
 

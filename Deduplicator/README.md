@@ -34,6 +34,17 @@ growing to exactly fit an append. Fixed by clearing with `clearContent` instead 
 `deleteRows` (`clearData`), which is immune to either, and by growing the grid explicitly
 in `appendRows` with 100 rows of headroom.
 
+**v5.1** — clickable links for review. The **Duplicates** sheet now has a **Duplicate Link**
+and an **Original Link** column, each holding the file's `https://drive.google.com/file/d/<id>/view`
+URL as a live hyperlink, so a pair can be opened and compared straight from the row before
+anything is trashed. The links are written as *rich text*, not `=HYPERLINK()` formulas —
+`appendRows` forces its range to plain-text format (the guard that stores a file named
+`=total.xlsx` as text), which would turn a formula into literal text; rich text is immune
+to that and `getValues()` still returns the plain URL. `getSheet` now also repairs a header
+row that does not match the current layout, so a `Duplicates` sheet written by v5.0 is
+re-headed (and its now-misaligned rows dropped) on the next scan instead of silently
+mislabelling columns.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -77,7 +88,7 @@ small cursors (`PHASE`, `ROOT_ID`, `QUEUE_CURSOR`, `PAGE_TOKEN`).
 |-------|---------|------|
 | `_scan_files` | File ID, Name, Size, Path, Hash | append-only record of every file seen |
 | `_scan_queue` | Folder ID, Path | the folder frontier + a cursor into it |
-| `Duplicates` | Duplicate Name/Path/ID, Original Name/Path, Size, Hash, Status | the reviewable result |
+| `Duplicates` | Duplicate Name/Link/Path/ID, Original Name/Link/Path, Size, Hash, Status | the reviewable result |
 
 > **Why not `ScriptProperties`?** A single property value is capped at **9 KB** — about
 > 40 file records. v4 checkpointed the whole file list into one property, so every scan
