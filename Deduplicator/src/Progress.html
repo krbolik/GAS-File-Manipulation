@@ -7,20 +7,26 @@
     #url { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; margin-bottom: 12px; }
     .btn { background: #007aff; color: white; border: none; padding: 12px; border-radius: 8px; cursor: pointer; width: 100%; font-weight: bold; }
     .btn:disabled { background: #b0c4de; cursor: default; }
+    .btn.secondary { background: #eef2f7; color: #1c1c1e; border: 1px solid #d7dee7; margin-top: 8px; }
+    .btn.secondary:disabled { color: #9aa3ad; background: #f4f7f9; }
+    .btn.danger { background: #ff3b30; margin-top: 8px; }
     .status-area { margin-top: 15px; padding: 12px; background: #eef2f7; border-radius: 8px; border-left: 4px solid #34c759; }
+    .status-area.warn { border-left-color: #ff9500; }
     .label { font-size: 10px; color: #666; text-transform: uppercase; font-weight: bold; }
     #parent-txt, #folder-txt, #file-txt { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
     #counts { font-size: 11px; color: #666; margin-top: 8px; }
-    #results { min-height: 120px; max-height: 220px; overflow-y: auto; margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; }
+    #results { min-height: 100px; max-height: 200px; overflow-y: auto; margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; }
     .note { color: #666; font-size: 11px; }
+    .err { color: #c1121f; }
   </style>
 </head>
 <body>
   <div class="card">
     <input type="text" id="url" placeholder="Paste Google Drive URL here...">
     <button id="mainBtn" class="btn" onclick="startScan()">Analyze Folder</button>
+    <button id="cmpBtn" class="btn secondary" style="display:none" onclick="compareNow()"></button>
 
-    <div class="status-area">
+    <div class="status-area" id="statusArea">
       <div class="label">Parent Folder:</div>
       <div id="parent-txt">Idle</div>
       <div class="label" style="margin-top:8px">Scanning Folder:</div>
@@ -31,17 +37,80 @@
     </div>
 
     <div id="results"></div>
-    <button id="delBtn" class="btn" style="display:none; background:#ff3b30" onclick="confirmDelete()">Move Duplicates to Trash</button>
+    <button id="delBtn" class="btn danger" style="display:none" onclick="confirmDelete()">Move Duplicates to Trash</button>
   </div>
 
   <script>
-    let pollInterval;
+    /*
+     * The server checkpoints everything it does, so the client's job is to keep
+     * calling until the work is finished and to never leave the user stranded:
+     *  - a failed call is retried instead of ending the run (MAX_RETRIES in a row),
+     *  - "Pause & Compare" turns an unfinished scan into a usable duplicate list,
+     *  - the trash button is offered whenever the sheet holds unhandled rows, no
+     *    matter how the scan that produced them ended.
+     */
+    const MAX_RETRIES = 6;
+    const RETRY_DELAY = 6000;
+
+    let pollInterval = null;
     let scanUrl = '';
+    let scanning = false;
+    let failures = 0;
+    let wantCompare = false;
+    let state = {};
+
+    document.addEventListener('DOMContentLoaded', refreshState);
+
+    /* ------------------------------------------------------------------ state */
+
+    function refreshState() {
+      google.script.run.withSuccessHandler(st => {
+        if (!st || st.error) return;
+        state = st;
+        if (!document.getElementById('url').value && st.rootUrl) {
+          document.getElementById('url').value = st.rootUrl;
+          scanUrl = st.rootUrl;
+        }
+        paintButtons();
+      }).getState();
+    }
+
+    function paintButtons() {
+      const main = document.getElementById('mainBtn');
+      const cmp = document.getElementById('cmpBtn');
+      const del = document.getElementById('delBtn');
+
+      main.disabled = scanning;
+      main.innerText = state.phase ? 'Resume Scan' : 'Analyze Folder';
+
+      if (scanning) {
+        cmp.style.display = 'block';
+        cmp.innerText = 'Pause & Compare What Is Scanned So Far';
+        cmp.disabled = wantCompare;
+      } else if (state.scannedFiles) {
+        cmp.style.display = 'block';
+        cmp.innerText = 'Compare ' + state.scannedFiles + ' Scanned Files Now';
+        cmp.disabled = false;
+      } else {
+        cmp.style.display = 'none';
+      }
+
+      if (state.dupePending) {
+        del.style.display = 'block';
+        // Trashing needs the script lock, which a running scan holds — pause it first.
+        del.disabled = scanning;
+        del.title = scanning ? 'Pause the scan first' : '';
+        del.innerText = 'Move ' + state.dupePending + ' Duplicates to Trash' +
+                        (scanning ? ' (pause the scan first)' : '');
+      } else {
+        del.style.display = 'none';
+      }
+    }
 
     function poll() {
       google.script.run.withSuccessHandler(s => {
         if (!s) return;
-        document.getElementById('parent-txt').innerText = s.currentParent || 'Scanning...';
+        document.getElementById('parent-txt').innerText = s.currentParent || '...';
         document.getElementById('folder-txt').innerText = s.currentFolder || '...';
         document.getElementById('file-txt').innerText = s.currentFile || '...';
         document.getElementById('counts').innerText =
@@ -49,99 +118,242 @@
       }).getLiveStatus();
     }
 
-    function startScan() {
-      const url = document.getElementById('url').value || scanUrl;
-      if (!url.startsWith('http')) return alert('Error: Please paste a Google Drive URL.');
-      scanUrl = url;
-
-      document.getElementById('mainBtn').disabled = true;
-      document.getElementById('delBtn').style.display = 'none';
-      document.getElementById('results').innerHTML = 'Scanning...';
-
+    function startPolling() {
       clearInterval(pollInterval);
       pollInterval = setInterval(poll, 1000);
-      google.script.run.withSuccessHandler(handleFinish)
-                       .withFailureHandler(handleFailure)
-                       .processFolder(url);
     }
 
-    function handleFailure(err) {
+    function stopPolling() {
       clearInterval(pollInterval);
-      document.getElementById('mainBtn').disabled = false;
-      document.getElementById('results').innerHTML = '<b>Failed:</b> ' + err.message;
+      pollInterval = null;
+      poll();
+    }
+
+    function say(html) { document.getElementById('results').innerHTML = html; }
+
+    function errText(err) {
+      if (!err) return 'the connection to Google dropped';
+      return err.message || String(err) || 'unknown error';
+    }
+
+    /* ------------------------------------------------------------------- scan */
+
+    function startScan() {
+      const url = document.getElementById('url').value || scanUrl;
+      if (!state.phase && !/^https?:/.test(url)) {
+        return alert('Error: Please paste a Google Drive folder URL.');
+      }
+      scanUrl = url;
+      scanning = true;
+      failures = 0;
+      wantCompare = false;
+      paintButtons();
+      document.getElementById('statusArea').className = 'status-area';
+      say(state.phase ? 'Resuming scan…' : 'Scanning…');
+      startPolling();
+      callScan();
+    }
+
+    function callScan() {
+      google.script.run.withSuccessHandler(handleFinish)
+                       .withFailureHandler(handleScanFailure)
+                       .processFolder(scanUrl);
+    }
+
+    /**
+     * A transport-level failure (execution killed, network blip) is not the end of the
+     * run: the checkpoint is on the server, so wait and call again. This is what used
+     * to surface as a dead "Failed: undefined" with no way forward.
+     */
+    function handleScanFailure(err) {
+      // A pause was requested: don't restart the scan (a fresh run clears the request),
+      // just go compare what is on the sheet. That is what the user asked for anyway.
+      if (wantCompare) {
+        wantCompare = false;
+        scanning = false;
+        return runCompare();
+      }
+      failures++;
+      if (failures > MAX_RETRIES) {
+        scanning = false;
+        stopPolling();
+        refreshState();
+        say('<b class="err">Scan stopped after ' + MAX_RETRIES + ' failed attempts:</b> ' +
+            errText(err) + '<br><span class="note">Nothing is lost — everything scanned so far is ' +
+            'checkpointed. Click <b>Resume Scan</b> to continue, or compare what is already ' +
+            'scanned and trash those duplicates.</span>');
+        return;
+      }
+      document.getElementById('statusArea').className = 'status-area warn';
+      say('<b>Hit an error:</b> ' + errText(err) + '<br><span class="note">Retrying in ' +
+          (RETRY_DELAY / 1000) + 's (attempt ' + failures + ' of ' + MAX_RETRIES +
+          '). The scan continues where it stopped.</span>');
+      setTimeout(callScan, RETRY_DELAY);
     }
 
     function handleFinish(res) {
+      if (!res) return handleScanFailure(null);
+
       if (res.error) {
-        clearInterval(pollInterval);
-        document.getElementById('mainBtn').disabled = false;
-        document.getElementById('results').innerHTML = '<b>Error:</b> ' + res.error;
+        if (res.resumable) return handleScanFailure({ message: res.error });
+        scanning = false;
+        stopPolling();
+        refreshState();
+        say('<b class="err">Error:</b> ' + res.error);
+        return;
+      }
+
+      failures = 0;
+      document.getElementById('statusArea').className = 'status-area';
+
+      if (res.paused) {
+        scanning = false;
+        stopPolling();
+        say('<b>Scan paused</b> after ' + res.count + ' files. Comparing what is scanned so far…');
+        if (wantCompare) { wantCompare = false; runCompare(); }
+        else refreshState();
         return;
       }
 
       if (res.timeout) {
-        document.getElementById('results').innerHTML =
-          '<b>' + res.phase + ' paused at the 6-minute limit (' + res.count + ' files so far).</b>' +
-          '<br>Resuming automatically in 3 seconds...';
-        setTimeout(startScan, 3000);
+        // The chunk ended on its own before the pause request reached it — same thing.
+        if (wantCompare) {
+          wantCompare = false;
+          scanning = false;
+          stopPolling();
+          return runCompare();
+        }
+        say('<b>' + res.phase + ' paused at the 6-minute limit (' + res.count +
+            ' files so far).</b><br>Resuming automatically in 3 seconds…');
+        // Honour a pause clicked during the gap: a new chunk would clear the request
+        // on the server and the user would wait out another full execution.
+        setTimeout(() => {
+          if (!wantCompare) return callScan();
+          wantCompare = false;
+          scanning = false;
+          stopPolling();
+          runCompare();
+        }, 3000);
         return;
       }
 
-      clearInterval(pollInterval);
-      poll();
-      document.getElementById('mainBtn').disabled = false;
-
-      const resDiv = document.getElementById('results');
-      if (!res.dupeCount) {
-        resDiv.innerHTML = '<b>Complete — no duplicates found.</b><br>' +
-          '<span class="note">' + res.totalFiles + ' files scanned, ' + res.skipped +
-          ' skipped (Google-native or empty).</span>';
-        return;
-      }
-
-      resDiv.innerHTML =
-        '<b>Found ' + res.dupeCount + ' duplicates</b> out of ' + res.totalFiles + ' files.<br>' +
-        '<span class="note">' + res.skipped + ' files skipped (Google-native or empty — these are ' +
-        'never reported as duplicates).</span><br><br>' +
-        'The full list is in the <a href="' + res.sheetUrl + '" target="_blank"><b>Duplicates</b></a> sheet. ' +
-        'Every row links straight to the duplicate and to the original in Drive — check them there, ' +
-        'delete any row you want to keep, then trash the rest.';
-      window.dupeCount = res.dupeCount;
-      document.getElementById('delBtn').style.display = 'block';
+      wantCompare = false;                  // the whole tree got compared anyway
+      scanning = false;
+      stopPolling();
+      showSummary(res, false);
     }
 
+    /* ---------------------------------------------------------------- compare */
+
+    function compareNow() {
+      document.getElementById('cmpBtn').disabled = true;
+      if (!scanning) return runCompare();
+      wantCompare = true;
+      say('<b>Pausing the scan…</b><span class="note"> it stops at the next folder, then the ' +
+          'files already scanned are compared.</span>');
+      google.script.run.requestPause();   // the running scan returns {paused:true}
+    }
+
+    function runCompare() {
+      startPolling();
+      say('<b>Comparing scanned files…</b>');
+      google.script.run.withSuccessHandler(res => {
+        stopPolling();
+        if (!res || res.error) {
+          refreshState();
+          return say('<b class="err">Could not compare:</b> ' + (res ? res.error : 'no response'));
+        }
+        showSummary(res, true);
+      }).withFailureHandler(err => {
+        stopPolling();
+        refreshState();
+        say('<b class="err">Could not compare:</b> ' + errText(err) +
+            '<br><span class="note">Nothing was lost — try again.</span>');
+      }).compareScannedSoFar();
+    }
+
+    function showSummary(res, partial) {
+      const isPartial = partial || res.partial;
+      let html = '<b>' + (isPartial ? 'Partial result — scan not finished. ' : 'Scan complete. ') +
+                 res.dupeCount + ' duplicate(s)</b> among ' + res.totalFiles + ' file(s) scanned.' +
+                 '<br><span class="note">' + res.skipped + ' skipped (Google-native or empty — never ' +
+                 'reported as duplicates).' +
+                 (res.alreadyHandled ? ' ' + res.alreadyHandled + ' row(s) were already handled earlier.' : '') +
+                 '</span>';
+      if (res.dupeCount) {
+        html += '<br><br>Full list in the <a href="' + res.sheetUrl + '" target="_blank"><b>Duplicates</b></a> ' +
+                'sheet — every row links to the duplicate and to the original in Drive. Delete any row you ' +
+                'want to keep, then trash the rest.';
+      }
+      if (isPartial) {
+        html += '<br><span class="note">These duplicates can be trashed right now; click <b>Resume Scan</b> ' +
+                'whenever you want the rest of the tree. Comparing again later keeps the rows already handled.</span>';
+      }
+      say(html);
+      refreshState();
+    }
+
+    /* ------------------------------------------------------------------ trash */
+
     function confirmDelete() {
-      if (!confirm('Move ' + window.dupeCount + ' files to Trash?\n\nOnly the duplicate copy is trashed; ' +
+      if (!confirm('Move ' + state.dupePending + ' files to Trash?\n\nOnly the duplicate copy is trashed; ' +
                    'the original stays. Trashed files remain recoverable from Drive Trash.')) return;
       document.getElementById('delBtn').disabled = true;
-      clearInterval(pollInterval);
-      pollInterval = setInterval(poll, 1000);
+      document.getElementById('mainBtn').disabled = true;
+      document.getElementById('cmpBtn').disabled = true;   // no sheet rewrite mid-trash
       window.trashedTotal = 0;
       window.errorTotal = 0;
+      failures = 0;
+      startPolling();
       runTrash();
     }
 
     function runTrash() {
       google.script.run.withSuccessHandler(res => {
-        if (res.error) {
-          clearInterval(pollInterval);
-          document.getElementById('delBtn').disabled = false;
-          return alert(res.error);
+        if (!res) return handleTrashFailure(null);
+        if (res.error && !res.resumable) {
+          stopPolling();
+          document.getElementById('mainBtn').disabled = false;
+          refreshState();
+          return say('<b class="err">Trashing stopped:</b> ' + res.error);
         }
-        window.trashedTotal += res.trashed;
-        window.errorTotal += res.errors;
+        window.trashedTotal += (res.trashed || 0);
+        window.errorTotal += (res.errors || 0);
+        if (res.error) return handleTrashFailure({ message: res.error });
+
+        failures = 0;
         if (res.remaining > 0) {
-          document.getElementById('results').innerHTML =
-            '<b>Trashing...</b> ' + res.remaining + ' left. Resuming after the 6-minute limit...';
+          say('<b>Trashing…</b> ' + window.trashedTotal + ' done, ' + res.remaining +
+              ' to go. Continuing past the 6-minute limit…');
           setTimeout(runTrash, 2000);
           return;
         }
-        clearInterval(pollInterval);
-        document.getElementById('results').innerHTML =
-          '<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' +
-          (window.errorTotal ? ', ' + window.errorTotal + ' failed — see the Status column in the Duplicates sheet.' : '.');
-        document.getElementById('delBtn').style.display = 'none';
-      }).withFailureHandler(handleFailure).trashDuplicates();
+        stopPolling();
+        document.getElementById('mainBtn').disabled = false;
+        say('<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' +
+            (window.errorTotal ? ', ' + window.errorTotal + ' failed — see the Status column in the ' +
+             'Duplicates sheet.' : '.'));
+        refreshState();
+      }).withFailureHandler(handleTrashFailure).trashDuplicates();
+    }
+
+    /** Same idea as the scan: rows are marked as they go, so retrying only ever continues. */
+    function handleTrashFailure(err) {
+      failures++;
+      if (failures > MAX_RETRIES) {
+        stopPolling();
+        document.getElementById('mainBtn').disabled = false;
+        refreshState();
+        say('<b class="err">Trashing stopped after ' + MAX_RETRIES + ' failed attempts:</b> ' +
+            errText(err) + '<br><span class="note">' + window.trashedTotal + ' file(s) were trashed. ' +
+            'The Status column records exactly which — click the trash button again to continue with ' +
+            'the rest.</span>');
+        return;
+      }
+      say('<b>Trashing hit an error:</b> ' + errText(err) + '<br><span class="note">Retrying in ' +
+          (RETRY_DELAY / 1000) + 's (attempt ' + failures + ' of ' + MAX_RETRIES +
+          '). Rows already marked are skipped.</span>');
+      setTimeout(runTrash, RETRY_DELAY);
     }
   </script>
 </body>

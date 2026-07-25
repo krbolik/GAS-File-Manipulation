@@ -45,6 +45,31 @@ row that does not match the current layout, so a `Duplicates` sheet written by v
 re-headed (and its now-misaligned rows dropped) on the next scan instead of silently
 mislabelling columns.
 
+**v5.2** — partial results and resilience. A scan of a large tree ran for many executions
+and then died with a dialog reading *"Failed: undefined"*, leaving ~1600 already-identified
+duplicates unusable because the trash button only appeared after a **completed** scan. Three
+things changed:
+
+- **A scan no longer has to finish to be useful.** *Pause & Compare* (dialog) or
+  **🚀 Angel → Compare Files Scanned So Far** (menu, works even with the dialog closed) stops
+  the walk at the next folder boundary, compares everything recorded so far and fills the
+  Duplicates sheet. Those rows can be trashed immediately; *Resume Scan* continues at the
+  cursor. Re-comparing later **carries over the Status** of rows already handled, so trashing
+  work is never lost or repeated. The pause flag travels through `CacheService`, not
+  `ScriptProperties` — the property store is read into an execution once, so a running scan
+  would not reliably see a flag set by the execution serving the button click.
+- **Failures retry instead of dead-ending.** The dialog re-invokes after a failed call (6
+  attempts, 6 s apart) because the server-side checkpoint survives; server errors come back
+  as `{error, resumable}` instead of throwing at the client, `describeError` fixes the
+  `undefined` message, and transient Drive/Sheets errors (rate limits, 5xx, *"failed while
+  accessing document"*) are retried in place with backoff. A folder that cannot be listed at
+  all (no permission, deleted mid-scan) is skipped instead of ending the walk.
+- **Trashing got faster and restartable.** Status is written in batches of 50 instead of one
+  `setValue` per row — the single-cell write was the bottleneck that made ~1600 rows need
+  several executions — and the dialog offers the trash button whenever the sheet holds
+  unhandled rows, however the scan that produced them ended. The soft deadline moved to
+  4.5 min for more headroom under the 6-min kill.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -62,7 +87,14 @@ mislabelling columns.
 5. When the scan finishes, the full duplicate list is written to the **Duplicates** sheet.
    Review it there — **delete any row you want to keep** — then click **Move Duplicates
    to Trash** in the dialog and confirm.
-6. To discard a paused or stale scan and start clean: **🚀 Angel → Reset Scan Progress**.
+6. **Don't want to wait for the whole tree?** Click **Pause & Compare What Is Scanned So Far**
+   at any time. The walk stops at the next folder, the files seen so far are compared, and the
+   duplicates among them can be trashed right away. **Resume Scan** continues where it stopped;
+   comparing again later keeps the rows you already trashed marked as handled.
+7. If the dialog was closed or its connection died, just reopen it — it reads the current state
+   back and offers **Resume Scan** plus the trash button for any unhandled rows. The same
+   compare is available without the dialog via **🚀 Angel → Compare Files Scanned So Far**.
+8. To discard a paused or stale scan and start clean: **🚀 Angel → Reset Scan Progress**.
 
 > The tool only ever trashes the **duplicate** copy (the first file seen for each
 > content hash is kept as the original). Trashed files stay recoverable from Drive Trash.
@@ -74,15 +106,19 @@ mislabelling columns.
 | Menu | `onOpen`, `showUi` | Adds the **🚀 Angel** menu and opens `Progress.html` as a modeless dialog. |
 | Scan | `processFolder`, `scanUntilDeadline` | Breadth-first walk driven by the `_scan_queue` sheet and a cursor in properties. Each folder is listed with `Drive.Files.list` (Advanced Drive Service); rows are appended to `_scan_files` in batches of 200. |
 | Hash | (none — Drive supplies it) | Uses Drive's own `md5Checksum` field. **No file is ever downloaded**, so there is no size limit and no `LARGE_<size>` fallback. |
-| Resume | `processFolder` (timeout branch) | On the 5-min soft limit the buffers are flushed, the queue cursor + page token are saved, and `{timeout:true}` is returned; the dialog re-invokes to continue. Resume is O(1) — no re-walking the tree. |
-| Detect | `runDeduplication` | Groups `_scan_files` by `md5 + size`; the first is the original, later matches go to the **Duplicates** sheet. |
-| Report | `getLiveStatus`, `Progress.html` | Live status is throttled into `CacheService` (~1 write / 2 s) and polled by the dialog, which shows a summary and links to the sheet. |
-| Delete | `trashDuplicates` | Trashes every un-handled row of the Duplicates sheet, writing `Trashed` / `Error: …` into the Status column. Resumes across the 6-min limit like the scan. |
+| Resume | `processFolder` (timeout branch) | On the 4.5-min soft limit the buffers are flushed, the queue cursor + page token are saved, and `{timeout:true}` is returned; the dialog re-invokes to continue. Resume is O(1) — no re-walking the tree. |
+| Pause | `requestPause`, `scanUntilDeadline` | A cache flag polled ~every 2 s by the walk. It flushes and returns `'PAUSED'` at a folder boundary, so partial results can be compared and trashed mid-scan. |
+| Detect | `runDeduplication` | Groups `_scan_files` by `md5 + size`; the first is the original, later matches go to the **Duplicates** sheet. Runnable at any time via `compareScannedSoFar`; carries over the Status of rows already handled. |
+| Report | `getLiveStatus`, `getState`, `Progress.html` | Live status is throttled into `CacheService` (~1 write / 2 s) and polled by the dialog; `getState` lets a reopened dialog resume and re-offer the trash button. |
+| Delete | `trashDuplicates` | Trashes every un-handled row of the Duplicates sheet, writing `Trashed` / `Error: …` into the Status column in batches of 50. Resumes across the 6-min limit like the scan. |
+| Recover | `withRetry`, `describeError`, `isSkippableFolderError` | Transient Drive/Sheets errors are retried with backoff, unreadable folders are skipped, and every failure reaches the dialog as a message it can retry from. |
 
 ## State storage
 
 All bulk state lives in sheets of the bound spreadsheet; `ScriptProperties` holds only
-small cursors (`PHASE`, `ROOT_ID`, `QUEUE_CURSOR`, `PAGE_TOKEN`).
+small cursors (`PHASE`, `ROOT_ID`, `QUEUE_CURSOR`, `PAGE_TOKEN`). `CacheService` carries the
+two cross-execution signals — the live status (`STATUS`) and the pause request
+(`PAUSE_REQUEST`).
 
 | Sheet | Columns | Role |
 |-------|---------|------|
