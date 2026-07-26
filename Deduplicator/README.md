@@ -126,6 +126,25 @@ would silently skip every folder already walked — and restarts the walk from t
 **A scan in progress when you upgrade therefore starts over**; a finished one just needs
 running again to pick up dates.
 
+**v5.4.1** — lock contention is no longer fatal. A trash run mid-way through ~1600 rows
+stopped with *"Trashing stopped: Another operation is running."* One chunk of the chain
+called the server while the previous execution still held the script lock; that reply was
+not flagged resumable, so the dialog treated ordinary contention as a dead end. It is
+self-clearing by construction — an execution cannot hold the lock past the 6-minute limit
+— so the right response is to wait.
+
+- `busyReply` marks it `busy` + `resumable`, and the server now waits `LOCK_WAIT` (20 s)
+  for its predecessor before answering at all, so most contention never reaches the client.
+- The dialog waits 20 s and calls again on `busy`, up to 20 times (≈ 7 min, comfortably
+  longer than any lock can be held), reporting *"Waiting… progress so far is safe"* rather
+  than stopping. Its retry budget is separate from the failure budget, since waiting is
+  not failing.
+- While trashing, Resume/Compare stay disabled. A state refresh used to re-enable them
+  mid-run, and starting a scan during a trash run is one way to *cause* the contention.
+
+Nothing was ever at risk: Status is written per row as the run proceeds, so clicking the
+button again always continues rather than repeating.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.

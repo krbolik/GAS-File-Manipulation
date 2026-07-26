@@ -91,6 +91,21 @@ const STATUS_EVERY = 2000;           // ms between live-status writes
 const PAGE_SIZE = 1000;              // Drive list page size
 const TRASH_FLUSH = 50;              // Status cells written per batch while trashing
 const RETRY_TRIES = 4;               // attempts per Drive/Sheets call before giving up
+const LOCK_WAIT = 20 * 1000;         // how long to wait for a busy predecessor to finish
+
+/**
+ * Reply for "someone else holds the script lock". This is ordinary contention between
+ * consecutive chunks of the same job, not a failure: an execution can hold the lock for
+ * at most the 6-minute limit, so it always clears. It is flagged resumable+busy so the
+ * dialog waits and calls again rather than ending a job that is halfway done.
+ */
+function busyReply(what) {
+  return {
+    error: what + ' is still running. Waiting for it to finish…',
+    resumable: true,
+    busy: true
+  };
+}
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
@@ -468,9 +483,7 @@ function getLiveStatus() {
  */
 function processFolder(inputUrl) {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(2000)) {
-    return { error: 'A scan is already running. Wait for it to finish, or use 🚀 Angel → Reset Scan Progress.' };
-  }
+  if (!lock.tryLock(LOCK_WAIT)) return busyReply('Another scan or trash run');
   try {
     const props = PropertiesService.getScriptProperties();
     const deadline = Date.now() + MAX_RUNTIME;
@@ -879,9 +892,7 @@ function compareScannedSoFar() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
     requestPause();
-    if (!lock.tryLock(90 * 1000)) {
-      return { error: 'The running scan did not pause in time. Wait a moment and try again.' };
-    }
+    if (!lock.tryLock(90 * 1000)) return busyReply('The scan');
   }
   try {
     const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
@@ -951,7 +962,7 @@ function getState() {
  */
 function trashDuplicates() {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(2000)) return { error: 'Another operation is running.' };
+  if (!lock.tryLock(LOCK_WAIT)) return busyReply('Another scan or trash run');
 
   const sh = getSheet(DUPES_SHEET, DUPES_HEADERS);
   let rows = [];

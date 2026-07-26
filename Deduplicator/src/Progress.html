@@ -51,11 +51,17 @@
      */
     const MAX_RETRIES = 6;
     const RETRY_DELAY = 6000;
+    // Lock contention is not a failure, so it gets its own budget: an execution can hold
+    // the script lock for at most the 6-minute limit, and 20 x 20s comfortably outlasts it.
+    const MAX_BUSY_WAITS = 20;
+    const BUSY_DELAY = 20000;
 
     let pollInterval = null;
     let scanUrl = '';
     let scanning = false;
+    let trashing = false;
     let failures = 0;
+    let busyWaits = 0;
     let wantCompare = false;
     let state = {};
 
@@ -80,7 +86,8 @@
       const cmp = document.getElementById('cmpBtn');
       const del = document.getElementById('delBtn');
 
-      main.disabled = scanning;
+      // Everything shares one script lock, so only one job may be started at a time.
+      main.disabled = scanning || trashing;
       main.innerText = state.phase ? 'Resume Scan' : 'Analyze Folder';
 
       if (scanning) {
@@ -90,7 +97,7 @@
       } else if (state.scannedFiles) {
         cmp.style.display = 'block';
         cmp.innerText = 'Compare ' + state.scannedFiles + ' Scanned Files Now';
-        cmp.disabled = false;
+        cmp.disabled = trashing;
       } else {
         cmp.style.display = 'none';
       }
@@ -98,10 +105,12 @@
       if (state.dupePending) {
         del.style.display = 'block';
         // Trashing needs the script lock, which a running scan holds — pause it first.
-        del.disabled = scanning;
+        del.disabled = scanning || trashing;
         del.title = scanning ? 'Pause the scan first' : '';
-        del.innerText = 'Move ' + state.dupePending + ' Duplicates to Trash' +
-                        (scanning ? ' (pause the scan first)' : '');
+        del.innerText = trashing
+          ? 'Trashing…'
+          : 'Move ' + state.dupePending + ' Duplicates to Trash' +
+            (scanning ? ' (pause the scan first)' : '');
       } else {
         del.style.display = 'none';
       }
@@ -130,6 +139,29 @@
     }
 
     function say(html) { document.getElementById('results').innerHTML = html; }
+
+    /**
+     * Handles "the lock is held by another execution": wait, then call `again`. The lock
+     * cannot be held longer than one execution, so this always resolves — but it is
+     * bounded anyway, and `giveUp` runs if the wait is somehow never satisfied.
+     */
+    function waitForLock(message, again, giveUp) {
+      busyWaits++;
+      if (busyWaits > MAX_BUSY_WAITS) {
+        busyWaits = 0;
+        stopPolling();
+        if (giveUp) giveUp();
+        refreshState();
+        say('<b class="err">Gave up waiting:</b> ' + message +
+            '<br><span class="note">Nothing was lost. Reload the sheet and click the button ' +
+            'again — work already done is recorded.</span>');
+        return;
+      }
+      say('<b>Waiting…</b> ' + message + '<br><span class="note">Retrying in ' +
+          (BUSY_DELAY / 1000) + 's (' + busyWaits + ' of ' + MAX_BUSY_WAITS +
+          '). Progress so far is safe.</span>');
+      setTimeout(again, BUSY_DELAY);
+    }
 
     function errText(err) {
       if (!err) return 'the connection to Google dropped';
@@ -195,6 +227,7 @@
       if (!res) return handleScanFailure(null);
 
       if (res.error) {
+        if (res.busy) return waitForLock(res.error, callScan, () => { scanning = false; });
         if (res.resumable) return handleScanFailure({ message: res.error });
         scanning = false;
         stopPolling();
@@ -204,6 +237,7 @@
       }
 
       failures = 0;
+      busyWaits = 0;
       document.getElementById('statusArea').className = 'status-area';
 
       if (res.paused) {
@@ -302,42 +336,46 @@
     function confirmDelete() {
       if (!confirm('Move ' + state.dupePending + ' files to Trash?\n\nThe newest copy of each file stays; ' +
                    'only the older copies are trashed. Trashed files remain recoverable from Drive Trash.')) return;
-      document.getElementById('delBtn').disabled = true;
-      document.getElementById('mainBtn').disabled = true;
-      document.getElementById('cmpBtn').disabled = true;   // no sheet rewrite mid-trash
+      trashing = true;
+      paintButtons();                                      // no other job may start now
       window.trashedTotal = 0;
       window.errorTotal = 0;
       failures = 0;
+      busyWaits = 0;
       startPolling();
       runTrash();
+    }
+
+    function endTrash(html) {
+      trashing = false;
+      stopPolling();
+      say(html);
+      refreshState();
     }
 
     function runTrash() {
       google.script.run.withSuccessHandler(res => {
         if (!res) return handleTrashFailure(null);
+        // Contention with a still-finishing chunk: wait it out, never end the job.
+        if (res.busy) return waitForLock(res.error, runTrash, () => { trashing = false; });
         if (res.error && !res.resumable) {
-          stopPolling();
-          document.getElementById('mainBtn').disabled = false;
-          refreshState();
-          return say('<b class="err">Trashing stopped:</b> ' + res.error);
+          return endTrash('<b class="err">Trashing stopped:</b> ' + res.error);
         }
         window.trashedTotal += (res.trashed || 0);
         window.errorTotal += (res.errors || 0);
         if (res.error) return handleTrashFailure({ message: res.error });
 
         failures = 0;
+        busyWaits = 0;
         if (res.remaining > 0) {
           say('<b>Trashing…</b> ' + window.trashedTotal + ' done, ' + res.remaining +
               ' to go. Continuing past the 6-minute limit…');
           setTimeout(runTrash, 2000);
           return;
         }
-        stopPolling();
-        document.getElementById('mainBtn').disabled = false;
-        say('<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' +
-            (window.errorTotal ? ', ' + window.errorTotal + ' failed — see the Status column in the ' +
-             'Duplicates sheet.' : '.'));
-        refreshState();
+        endTrash('<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' +
+                 (window.errorTotal ? ', ' + window.errorTotal + ' failed — see the Status column in the ' +
+                  'Duplicates sheet.' : '.'));
       }).withFailureHandler(handleTrashFailure).trashDuplicates();
     }
 
@@ -345,13 +383,10 @@
     function handleTrashFailure(err) {
       failures++;
       if (failures > MAX_RETRIES) {
-        stopPolling();
-        document.getElementById('mainBtn').disabled = false;
-        refreshState();
-        say('<b class="err">Trashing stopped after ' + MAX_RETRIES + ' failed attempts:</b> ' +
-            errText(err) + '<br><span class="note">' + window.trashedTotal + ' file(s) were trashed. ' +
-            'The Status column records exactly which — click the trash button again to continue with ' +
-            'the rest.</span>');
+        endTrash('<b class="err">Trashing stopped after ' + MAX_RETRIES + ' failed attempts:</b> ' +
+                 errText(err) + '<br><span class="note">' + window.trashedTotal + ' file(s) were trashed. ' +
+                 'The Status column records exactly which — click the trash button again to continue ' +
+                 'with the rest.</span>');
         return;
       }
       say('<b>Trashing hit an error:</b> ' + errText(err) + '<br><span class="note">Retrying in ' +
