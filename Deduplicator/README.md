@@ -164,6 +164,27 @@ moved. Rows where **Duplicate Date is newer than Original Date** are the swapped
 back. Note that `Ctrl+Z` cannot undo a script's edits, and a re-compare deliberately
 *keeps* swaps, so it will not clean them up either.
 
+**v5.4.3** — logging. Until now a run left no trace: when a menu swap appeared to do
+nothing there was no way to tell whether it had run at all, skipped every row, or never
+fired. `logIt` writes one line per meaningful step to the Executions log — read it in
+**Extensions → Apps Script → Executions**, signed in as *the account that ran it*, since
+executions run as the acting user and another account's view looks empty.
+
+A filtered menu swap now reads back like this:
+
+```
+Dedup swapSelectedRows start {"sheet":"Duplicates"}
+Dedup selection resolved {"ranges":["2:5"],"lastDataRow":5,"willAct":3,"hiddenSkipped":1,"rows":"2, 4, 5"}
+Dedup swapSelectedRows done {"swapped":3,"hiddenSkipped":1,"alreadyTrashed":0,"unusable":0}
+Dedup swapSelectedRows rows swapped 2, 4, 5
+```
+
+Traced: both swap paths (menu and checkbox) with the rows resolved and each skip's reason,
+every scan chunk's outcome, compare totals, each trash chunk's counts, lock contention,
+`resetToken`, and the walk restart. Deliberately aggregate — one line per file would flood
+the log and slow a 37K-file walk. The swap also toasts as well as alerting, since a modal
+is easy to miss and was previously the only sign the menu item had run.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.

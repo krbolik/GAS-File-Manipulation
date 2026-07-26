@@ -93,6 +93,38 @@ const TRASH_FLUSH = 50;              // Status cells written per batch while tra
 const RETRY_TRIES = 4;               // attempts per Drive/Sheets call before giving up
 const LOCK_WAIT = 20 * 1000;         // how long to wait for a busy predecessor to finish
 
+/* --------------------------------------------------------------------- log -- */
+
+const LOG_PREFIX = 'Dedup';
+const LOG_ROWS_SHOWN = 25;           // row numbers listed before the list is truncated
+
+/**
+ * Every trace goes through here, so a run can be read back in the Apps Script IDE under
+ * Executions (Extensions → Apps Script → Executions, signed in as the account that ran
+ * it — executions run as the acting user, so another account's view looks empty).
+ *
+ * Deliberately aggregate: the scan touches tens of thousands of files, and one line per
+ * file would both flood the log and slow the walk. Logging must never be the thing that
+ * breaks a run, hence the swallowed error.
+ */
+function logIt(where, detail) {
+  try {
+    let text = '';
+    if (detail !== undefined && detail !== null) {
+      text = ' ' + (typeof detail === 'string' ? detail : JSON.stringify(detail));
+    }
+    console.log(LOG_PREFIX + ' ' + where + text);
+  } catch (ignored) {}
+}
+
+/** Row numbers as "2, 3, 4 …(+120 more)" — readable without dumping thousands of them. */
+function rowList(rows) {
+  const shown = rows.slice(0, LOG_ROWS_SHOWN).join(', ');
+  return rows.length > LOG_ROWS_SHOWN
+    ? shown + ' …(+' + (rows.length - LOG_ROWS_SHOWN) + ' more)'
+    : shown;
+}
+
 /**
  * Reply for "someone else holds the script lock". This is ordinary contention between
  * consecutive chunks of the same job, not a failure: an execution can hold the lock for
@@ -149,15 +181,17 @@ function onEdit(e) {
     const first = e.range.getRow();
     const ticks = e.range.getValues();
     let swapped = 0, blocked = 0, bad = 0;
+    const done = [];
 
     for (let i = 0; i < ticks.length; i++) {
       const row = first + i;
       if (row < 2 || ticks[i][0] !== true) continue;
       const outcome = swapKeeper(sh, row);
-      if (outcome === 'OK') swapped++;
+      if (outcome === 'OK') { swapped++; done.push(row); }
       else if (outcome === 'TRASHED') blocked++;
       else bad++;
     }
+    logIt('swap checkbox', { rows: rowList(done), swapped: swapped, alreadyTrashed: blocked, unusable: bad });
 
     // Clear the boxes we just acted on — a programmatic write does not re-trigger onEdit.
     e.range.setValues(ticks.map(() => [false]));
@@ -187,22 +221,34 @@ function onEdit(e) {
 function swapSelectedRows() {
   const ui = SpreadsheetApp.getUi();
   const sh = SpreadsheetApp.getActiveSheet();
+  logIt('swapSelectedRows start', { sheet: sh.getName() });
   if (sh.getName() !== DUPES_SHEET) {
+    logIt('swapSelectedRows aborted', 'active sheet is not ' + DUPES_SHEET);
     return ui.alert('Select the rows to swap in the "' + DUPES_SHEET + '" sheet first.');
   }
   const sel = selectedDataRows(sh);
   let swapped = 0, blocked = 0, bad = 0;
+  const done = [];
   sel.rows.forEach(row => {
     const outcome = swapKeeper(sh, row);
-    if (outcome === 'OK') swapped++;
+    if (outcome === 'OK') { swapped++; done.push(row); }
     else if (outcome === 'TRASHED') blocked++;
     else bad++;
   });
-  ui.alert(swapped + ' row(s) swapped: the file listed as "Original" is now the one that ' +
-           'will be trashed.' +
-           (sel.hidden ? '\n' + sel.hidden + ' hidden row(s) skipped (filtered or hidden by hand).' : '') +
-           (blocked ? '\n' + blocked + ' row(s) skipped — already trashed.' : '') +
-           (bad ? '\n' + bad + ' row(s) skipped — no usable links in the row.' : ''));
+
+  const summary = { swapped: swapped, hiddenSkipped: sel.hidden, alreadyTrashed: blocked, unusable: bad };
+  logIt('swapSelectedRows done', summary);
+  if (done.length) logIt('swapSelectedRows rows swapped', rowList(done));
+
+  const msg = swapped + ' row(s) swapped: the file listed as "Original" is now the one that ' +
+              'will be trashed.' +
+              (sel.hidden ? '\n' + sel.hidden + ' hidden row(s) skipped (filtered or hidden by hand).' : '') +
+              (blocked ? '\n' + blocked + ' row(s) skipped — already trashed.' : '') +
+              (bad ? '\n' + bad + ' row(s) skipped — no usable links in the row.' : '');
+  // Toast as well as the alert: a modal is easy to miss, and this is the only confirmation
+  // that the menu item ran at all.
+  try { SpreadsheetApp.getActiveSpreadsheet().toast(msg, 'Swap ⇄', 8); } catch (ignored) {}
+  ui.alert(msg);
 }
 
 /**
@@ -231,6 +277,13 @@ function selectedDataRows(sh) {
   });
 
   rows.sort((a, b) => a - b);
+  logIt('selection resolved', {
+    ranges: ranges.map(r => r.getRow() + ':' + (r.getRow() + r.getNumRows() - 1)),
+    lastDataRow: lastData,
+    willAct: rows.length,
+    hiddenSkipped: hidden,
+    rows: rowList(rows)
+  });
   return { rows: rows, hidden: hidden };
 }
 
@@ -259,9 +312,20 @@ function swapKeeper(sh, row) {
   const dupUrl = dupe[1], origUrl = orig[1];
   const status = v[D_COL_STATUS - 1];
 
-  if (String(status).indexOf('Trashed') === 0) return 'TRASHED';
+  if (String(status).indexOf('Trashed') === 0) {
+    logIt('swap skipped', { row: row, reason: 'already trashed' });
+    return 'TRASHED';
+  }
   const newDupeId = parseFileIdFromUrl(origUrl);
-  if (!newDupeId || !dupUrl) return 'SKIP';
+  if (!newDupeId || !dupUrl) {
+    logIt('swap skipped', {
+      row: row,
+      reason: !dupUrl && !origUrl ? 'row has no links (blank row?)'
+            : !newDupeId ? 'no file id in the Original Link'
+            : 'no Duplicate Link'
+    });
+    return 'SKIP';
+  }
 
   // Columns 1..8 are the duplicate's name/link/path/date then the original's.
   sh.getRange(row, D_COL_DUPE_NAME, 1, D_COL_ORIG_DATE).setNumberFormat('@')
@@ -296,6 +360,7 @@ function showUi() {
 }
 
 function resetToken() {
+  logIt('resetToken', 'clearing checkpoint sheets, properties and cache');
   [FILES_SHEET, QUEUE_SHEET, DUPES_SHEET].forEach(name => {
     const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
     if (sh) clearData(sh);
@@ -523,7 +588,10 @@ function getLiveStatus() {
  */
 function processFolder(inputUrl) {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_WAIT)) return busyReply('Another scan or trash run');
+  if (!lock.tryLock(LOCK_WAIT)) {
+    logIt('processFolder busy', 'could not get the lock in ' + (LOCK_WAIT / 1000) + 's');
+    return busyReply('Another scan or trash run');
+  }
   try {
     const props = PropertiesService.getScriptProperties();
     const deadline = Date.now() + MAX_RUNTIME;
@@ -541,8 +609,15 @@ function processFolder(inputUrl) {
     }
     clearPause();                       // a stale request must not stop this run at once
 
+    logIt('processFolder start', { phase: phase, cursor: props.getProperty(P_CURSOR) });
+
     if (phase === 'SCAN') {
       const outcome = scanUntilDeadline(deadline);
+      logIt('scan chunk ended', {
+        outcome: outcome,
+        files: statusState.files || 0,
+        folders: statusState.folders || ''
+      });
       if (outcome !== 'DONE') {
         return {
           timeout: outcome === 'TIMEOUT',
@@ -563,6 +638,7 @@ function processFolder(inputUrl) {
   } catch (e) {
     const msg = describeError(e);
     let resumable = false;
+    logIt('processFolder failed', msg);
     // Both of these touch services that may themselves be the thing that failed.
     try { setStatus({ currentFile: 'Error: ' + msg }, true); } catch (ignored) {}
     try { resumable = !!PropertiesService.getScriptProperties().getProperty(P_PHASE); } catch (ignored) {}
@@ -616,6 +692,7 @@ function restartWalkIfRecordsLost() {
   if (!cursor || !rootId) return false;
   if (getSheet(FILES_SHEET, FILES_HEADERS).getLastRow() > 1) return false;
 
+  logIt('restarting walk', 'cursor was at ' + cursor + ' but _scan_files is empty');
   seedQueue(rootId);
   setStatus({ currentFile: 'Scan records were reset by an upgrade — restarting the walk…' }, true);
   return true;
@@ -822,6 +899,15 @@ function runDeduplication() {
   linkifyColumn(dupesSh, start, D_COL_ORIG_LINK, dupeRows.map(r => r[D_COL_ORIG_LINK - 1]));
   if (start) dupesSh.getRange(start, D_COL_SWAP, dupeRows.length, 1).insertCheckboxes();
   setStatus({ currentFile: 'Compared — ' + dupeRows.length + ' duplicates', files: rows.length }, true);
+  logIt('compare done', {
+    files: rows.length,
+    duplicates: dupeRows.length,
+    pending: dupeRows.length - carried,
+    alreadyHandled: carried,
+    swapsKept: kept,
+    noHashOrEmpty: skipped,
+    undated: undated
+  });
 
   return {
     done: true,
@@ -929,8 +1015,10 @@ function dupesSheetUrl(dupesSh) {
  * boundary, having flushed its checkpoint, and the dialog can resume it afterwards.
  */
 function compareScannedSoFar() {
+  logIt('compareScannedSoFar start');
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
+    logIt('compareScannedSoFar', 'a scan holds the lock — asking it to pause');
     requestPause();
     if (!lock.tryLock(90 * 1000)) return busyReply('The scan');
   }
@@ -1002,7 +1090,10 @@ function getState() {
  */
 function trashDuplicates() {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_WAIT)) return busyReply('Another scan or trash run');
+  if (!lock.tryLock(LOCK_WAIT)) {
+    logIt('trash busy', 'could not get the lock in ' + (LOCK_WAIT / 1000) + 's');
+    return busyReply('Another scan or trash run');
+  }
 
   const sh = getSheet(DUPES_SHEET, DUPES_HEADERS);
   let rows = [];
@@ -1060,10 +1151,12 @@ function trashDuplicates() {
     flushStatus();
     setStatus({ currentFile: 'Trashed ' + trashed + ' file(s)' +
                              (remaining ? ' — ' + remaining + ' to go' : '') }, true);
+    logIt('trash chunk done', { rowsOnSheet: rows.length, trashed: trashed, errors: errors, remaining: remaining });
     return { trashed: trashed, errors: errors, remaining: remaining };
   } catch (e) {
     // Record what did get trashed before surfacing the failure, and let the client retry.
     try { flushStatus(); } catch (ignored) {}
+    logIt('trash chunk failed', { error: describeError(e), trashed: trashed, errors: errors });
     return { error: describeError(e), trashed: trashed, errors: errors, resumable: true };
   } finally {
     lock.releaseLock();
