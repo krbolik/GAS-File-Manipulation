@@ -231,6 +231,33 @@ for names, wrong for numerics, where it makes `"9" > "10"` and breaks filter-by-
 columns are rewritten with a numeric format after the append (`numberColumn`), so sorting by
 size and filtering for `Copies > 2` behave as expected.
 
+**v5.7** — the scan no longer needs your computer. Until now the dialog was the only scheduler:
+each chunk existed because an open browser tab asked for it, so closing the lid paused a
+multi-hour walk. **🚀 Angel → Run Scan in the Background** installs a time-driven trigger that
+fires every 5 minutes server-side, so the scan and the comparison continue with the machine
+switched off. **Stop Background Scan** cancels it; it also removes itself once the work is done.
+
+Three limits, all deliberate:
+
+- **It never trashes.** Discovery, comparison and decoration are reversible; trashing is not,
+  and nothing irreversible should run while nobody is watching. The trigger stops and leaves
+  the sheet for review. The harness asserts no tick ever calls `setTrashed`.
+- **5 hours of runtime per day** (`BG_DAILY_BUDGET_MS`), self-imposed below the ~6 h/day
+  Workspace trigger pool so about an hour stays free for other scheduled scripts. Reaching the
+  cap does not uninstall the trigger — ticks return immediately until the date rolls over, so
+  work resumes by itself. The last tick before the cap also shortens its own slice
+  (`processFolder(url, maxMs)`) rather than overshooting.
+- **It yields to you.** `processFolder` clears the pause flag when it starts, so a naive trigger
+  would undo *Pause & Compare* on its next firing. The tick checks for a pause request first and
+  uninstalls itself if it finds one — so pausing is also how you take back manual control.
+
+Quotas are **per user**, and `ScriptProperties` / `CacheService` / `LockService` are
+**script-scoped**, so a second account with edit access resumes the same scan at the same cursor
+on its own daily budget — a legitimate way past an exhausted quota. Caveats: triggers belong to
+whoever installed them, and `setTrashed` can fail on files that account doesn't own (those rows
+show `Error: …` and can be retried by the owner). See
+[ARCHITECTURE.md §4](ARCHITECTURE.md) for the full scheduler model.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -253,10 +280,14 @@ size and filtering for `Copies > 2` behave as expected.
    at any time. The walk stops at the next folder, the files seen so far are compared, and the
    duplicates among them can be trashed right away. **Resume Scan** continues where it stopped;
    comparing again later keeps the rows you already trashed marked as handled.
-7. If the dialog was closed or its connection died, just reopen it — it reads the current state
+7. **Don't want to keep the computer on?** **🚀 Angel → Run Scan in the Background** (or the
+   button in the dialog) hands the scan to a server-side trigger: it continues every 5 minutes
+   with the tab closed and the machine off, up to 5 hours of runtime per day, and stops itself
+   when the scan and comparison are finished. It **never trashes** — that stays a manual step.
+8. If the dialog was closed or its connection died, just reopen it — it reads the current state
    back and offers **Resume Scan** plus the trash button for any unhandled rows. The same
    compare is available without the dialog via **🚀 Angel → Compare Files Scanned So Far**.
-8. To discard a paused or stale scan and start clean: **🚀 Angel → Reset Scan Progress**.
+9. To discard a paused or stale scan and start clean: **🚀 Angel → Reset Scan Progress**.
 
 > **The newest copy is the one that survives.** For each set of byte-identical files the
 > most recently modified copy is kept as the original and every older copy is trashed —
@@ -268,6 +299,7 @@ size and filtering for `Copies > 2` behave as expected.
 | Stage | Function(s) | What happens |
 |-------|-------------|--------------|
 | Menu | `onOpen`, `showUi` | Adds the **🚀 Angel** menu and opens `Progress.html` as a modeless dialog. |
+| Unattended | `setBackgroundScan`, `backgroundScanTick` | A 5-minute time-driven trigger drives scan → compare → decorate with no browser open, inside a 5 h/day self-imposed runtime budget, and removes itself when done. Never trashes; stops if a pause is requested. |
 | Scan | `processFolder`, `scanUntilDeadline` | Breadth-first walk driven by the `_scan_queue` sheet and a cursor in properties. Each folder is listed with `Drive.Files.list` (Advanced Drive Service); rows are appended to `_scan_files` in batches of 200. |
 | Hash | (none — Drive supplies it) | Uses Drive's own `md5Checksum` field. **No file is ever downloaded**, so there is no size limit and no `LARGE_<size>` fallback. |
 | Resume | `processFolder` (timeout branch) | On the 4.5-min soft limit the buffers are flushed, the queue cursor + page token are saved, and `{timeout:true}` is returned; the dialog re-invokes to continue. Resume is O(1) — no re-walking the tree. |
@@ -281,7 +313,8 @@ size and filtering for `Copies > 2` behave as expected.
 ## State storage
 
 All bulk state lives in sheets of the bound spreadsheet; `ScriptProperties` holds only
-small cursors (`PHASE`, `ROOT_ID`, `QUEUE_CURSOR`, `PAGE_TOKEN`). `CacheService` carries the
+small cursors (`PHASE`, `ROOT_ID`, `QUEUE_CURSOR`, `PAGE_TOKEN`, `LINKS_FROM`) plus the
+background runner's daily ledger (`BG_DAY`, `BG_USED_MS`). `CacheService` carries the
 two cross-execution signals — the live status (`STATUS`) and the pause request
 (`PAUSE_REQUEST`).
 

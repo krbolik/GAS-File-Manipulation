@@ -25,6 +25,8 @@
     <input type="text" id="url" placeholder="Paste Google Drive URL here...">
     <button id="mainBtn" class="btn" onclick="startScan()">Analyze Folder</button>
     <button id="cmpBtn" class="btn secondary" style="display:none" onclick="compareNow()"></button>
+    <button id="bgBtn" class="btn secondary" style="display:none" onclick="toggleBackground()"></button>
+    <div id="bgNote" class="note" style="margin-top:6px"></div>
 
     <div class="status-area" id="statusArea">
       <div class="label">Parent Folder:</div>
@@ -105,6 +107,8 @@
         cmp.style.display = 'none';
       }
 
+      paintBackground();
+
       if (state.dupePending) {
         del.style.display = 'block';
         // Trashing needs the script lock, which a running scan holds — pause it first.
@@ -117,6 +121,53 @@
       } else {
         del.style.display = 'none';
       }
+    }
+
+    /*
+     * Background mode hands the scan to a server-side trigger, so it survives this tab
+     * closing and the machine being switched off. Offered whenever there is a scan to
+     * continue; hidden once there is nothing left for it to do.
+     */
+    function paintBackground() {
+      const btn = document.getElementById('bgBtn');
+      const note = document.getElementById('bgNote');
+      const bg = state.background || {};
+      const worthOffering = bg.running || state.phase || state.linksPending;
+
+      if (!worthOffering) {
+        btn.style.display = 'none';
+        note.innerText = '';
+        return;
+      }
+      btn.style.display = 'block';
+      btn.disabled = false;
+      btn.innerText = bg.running ? 'Stop Background Scan' : 'Run in the Background (computer can be off)';
+      note.innerHTML = bg.running
+        ? '<b>Running on Google\'s servers</b> every ' + bg.everyMinutes + ' min — this tab can be ' +
+          'closed. ' + bg.usedMin + ' of ' + bg.budgetMin + ' min used today. Never trashes.'
+        : 'Hands the scan to a server-side trigger so it continues with your computer off. ' +
+          'Limited to ' + (bg.budgetMin || 300) + ' min/day.';
+    }
+
+    function toggleBackground() {
+      const btn = document.getElementById('bgBtn');
+      const on = !(state.background && state.background.running);
+      btn.disabled = true;
+      google.script.run.withSuccessHandler(res => {
+        if (res && res.error) { say('<b class="err">' + res.error + '</b>'); }
+        else if (on) {
+          say('<b>Background scanning is on.</b><span class="note"> The scan continues on ' +
+              'Google\'s servers — you can close this tab and switch the computer off. It stops ' +
+              'itself when the scan and comparison are done, and it never trashes anything.</span>');
+        } else {
+          say('<b>Background scanning is off.</b><span class="note"> Use Resume Scan to carry ' +
+              'on by hand.</span>');
+        }
+        refreshState();
+      }).withFailureHandler(err => {
+        btn.disabled = false;
+        say('<b class="err">Could not change background mode:</b> ' + errText(err));
+      }).setBackgroundScan(on);
     }
 
     function poll() {

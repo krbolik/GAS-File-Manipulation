@@ -154,6 +154,20 @@ const P_ROOT = 'ROOT_ID';
 const P_CURSOR = 'QUEUE_CURSOR';
 const P_PAGE = 'PAGE_TOKEN';
 const P_LINKS_FROM = 'LINKS_FROM';   // first Duplicates row still needing its links
+const P_BG_DAY = 'BG_DAY';           // yyyy-MM-dd the background budget below belongs to
+const P_BG_USED = 'BG_USED_MS';      // background runtime already spent on that day
+
+const BG_TRIGGER_FN = 'backgroundScanTick';
+const BG_EVERY_MINUTES = 5;          // trigger cadence; a chunk is 4.5 min, so no overlap
+const BG_MIN_SLICE_MS = 30 * 1000;   // below this, a tick is not worth its own overhead
+
+/**
+ * Self-imposed daily ceiling on *background* runtime, deliberately below the platform's
+ * ~6 h/day trigger budget for Workspace accounts so roughly an hour stays available for
+ * the owner's other scheduled scripts. Reaching it does not uninstall the trigger: ticks
+ * simply do nothing until the date rolls over.
+ */
+const BG_DAILY_BUDGET_MS = 5 * 60 * 60 * 1000;
 
 const READ_PAGE_ROWS = 50000;        // rows per getValues when streaming a big sheet
 
@@ -165,8 +179,182 @@ function onOpen() {
       .addItem('Start Deduplicator', 'showUi')
       .addItem('Compare Files Scanned So Far', 'compareScannedSoFarMenu')
       .addItem('Keep Duplicate Instead (selected rows)', 'swapSelectedRows')
+      .addSeparator()
+      .addItem('Run Scan in the Background', 'startBackgroundScanMenu')
+      .addItem('Stop Background Scan', 'stopBackgroundScanMenu')
+      .addSeparator()
       .addItem('Reset Scan Progress', 'resetToken')
       .addToUi();
+}
+
+/* Menu wrappers. The functions they call are UI-free so the dialog can call them too. */
+
+function startBackgroundScanMenu() {
+  const res = setBackgroundScan(true);
+  const ui = SpreadsheetApp.getUi();
+  if (res.error) return ui.alert(res.error);
+  ui.alert('Background scanning is ON.\n\nThe scan now continues on Google\'s servers every ' +
+           res.everyMinutes + ' minutes — you can close this tab and switch your computer off.\n\n' +
+           'Daily limit: ' + res.budgetMin + ' minutes of runtime (' + res.leftMin +
+           ' left today), leaving room for your other scripts. It stops by itself when the ' +
+           'scan and comparison are finished.\n\nIt never trashes anything — that stays a ' +
+           'manual step.');
+}
+
+function stopBackgroundScanMenu() {
+  const res = setBackgroundScan(false);
+  SpreadsheetApp.getUi().alert(res.running
+      ? 'Background scanning is still on — the trigger could not be removed. Try again.'
+      : 'Background scanning is OFF. Use the dialog to continue by hand.');
+}
+
+/* --------------------------------------------------- background scan runner -- */
+
+/**
+ * The scan is normally driven by the dialog: each chunk exists because the browser asked
+ * for it. That makes a multi-hour walk hostage to a machine staying awake. A time-driven
+ * trigger removes that dependency — it fires server-side every BG_EVERY_MINUTES with no
+ * browser involved, so the computer can be switched off.
+ *
+ * Three deliberate limits:
+ *   - It **never trashes**. Discovery, comparison and decoration are reversible; trashing
+ *     is not, and nothing irreversible should happen while nobody is watching.
+ *   - It respects a self-imposed daily runtime budget (BG_DAILY_BUDGET_MS).
+ *   - It yields to the reviewer: a pause request switches background mode off rather than
+ *     clearing the pause and carrying on, so the two never fight over the same scan.
+ */
+function setBackgroundScan(on) {
+  const props = PropertiesService.getScriptProperties();
+  if (!on) {
+    const removed = removeBackgroundTriggers();
+    logIt('background scan stopped', { triggersRemoved: removed });
+    return backgroundInfo();
+  }
+  if (!props.getProperty(P_PHASE) && !props.getProperty(P_LINKS_FROM)) {
+    return { error: 'Nothing to run in the background — start or resume a scan first.' };
+  }
+  removeBackgroundTriggers();                    // never stack duplicates
+  ScriptApp.newTrigger(BG_TRIGGER_FN).timeBased().everyMinutes(BG_EVERY_MINUTES).create();
+  clearPause();                                  // a stale pause would stop it immediately
+  logIt('background scan started', {
+    everyMinutes: BG_EVERY_MINUTES,
+    dailyBudgetMin: Math.round(BG_DAILY_BUDGET_MS / 60000)
+  });
+  return backgroundInfo();
+}
+
+/** One slice of background work. Installed as a time-driven trigger; see setBackgroundScan. */
+function backgroundScanTick() {
+  const started = Date.now();
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const budget = bgBudget();
+
+    if (budget.leftMs < BG_MIN_SLICE_MS) {
+      logIt('background tick skipped', {
+        reason: 'daily budget spent',
+        usedMin: Math.round(budget.usedMs / 60000),
+        budgetMin: Math.round(budget.budgetMs / 60000),
+        day: budget.day
+      });
+      return;                                    // trigger stays; it resumes after midnight
+    }
+
+    // A human asked the scan to stop — honour that instead of clearing the flag and racing.
+    if (pauseRequested()) {
+      logIt('background scan stopping', 'a pause was requested from the sheet');
+      removeBackgroundTriggers();
+      return;
+    }
+
+    if (props.getProperty(P_LINKS_FROM)) {       // finish decoration before anything else
+      const res = finishPendingLinks();
+      logIt('background tick decorated', { pending: !!res.pending, error: res.error || '' });
+      if (!res.pending && !props.getProperty(P_PHASE)) finishBackgroundScan();
+      return;
+    }
+
+    if (!props.getProperty(P_PHASE)) {           // scan and compare are both complete
+      finishBackgroundScan();
+      return;
+    }
+
+    const res = processFolder('', budget.leftMs);
+    logIt('background tick', {
+      files: res.count || res.totalFiles || 0,
+      done: !!res.done,
+      paused: !!res.paused,
+      busy: !!res.busy,
+      error: res.error || ''
+    });
+
+    if (res.paused) { removeBackgroundTriggers(); return; }
+    if (res.done && !res.linksPending) finishBackgroundScan();
+
+  } catch (e) {
+    logIt('background tick failed', describeError(e));   // trigger survives; next tick retries
+  } finally {
+    bgSpend(Date.now() - started);
+  }
+}
+
+function finishBackgroundScan() {
+  removeBackgroundTriggers();
+  setStatus({ currentFile: 'Background scan finished — review the Duplicates sheet' }, true);
+  logIt('background scan complete', 'trigger removed');
+}
+
+function removeBackgroundTriggers() {
+  let removed = 0;
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === BG_TRIGGER_FN) { ScriptApp.deleteTrigger(t); removed++; }
+  });
+  return removed;
+}
+
+/**
+ * Background runtime spent today, resetting when the date rolls over in the script's own
+ * timezone. Accounting is wall-clock per tick, which is what the platform's own runtime
+ * quota measures. It counts *this* runner only — the owner's other scripts draw on the
+ * same daily pool, which is exactly why the budget is set below the platform ceiling.
+ */
+function bgBudget() {
+  const props = PropertiesService.getScriptProperties();
+  const day = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  let used = Number(props.getProperty(P_BG_USED) || 0);
+  if (props.getProperty(P_BG_DAY) !== day) {
+    used = 0;
+    props.setProperties({ [P_BG_DAY]: day, [P_BG_USED]: '0' });
+  }
+  return {
+    day: day,
+    usedMs: used,
+    budgetMs: BG_DAILY_BUDGET_MS,
+    leftMs: Math.max(0, BG_DAILY_BUDGET_MS - used)
+  };
+}
+
+function bgSpend(ms) {
+  const b = bgBudget();
+  PropertiesService.getScriptProperties().setProperties({
+    [P_BG_DAY]: b.day,
+    [P_BG_USED]: String(b.usedMs + Math.max(0, ms))
+  });
+}
+
+function backgroundInfo() {
+  const b = bgBudget();
+  let running = false;
+  try {
+    running = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === BG_TRIGGER_FN);
+  } catch (ignored) {}
+  return {
+    running: running,
+    usedMin: Math.round(b.usedMs / 60000),
+    budgetMin: Math.round(b.budgetMs / 60000),
+    leftMin: Math.round(b.leftMs / 60000),
+    everyMinutes: BG_EVERY_MINUTES
+  };
 }
 
 /* --------------------------------------------------------------------- swap -- */
@@ -618,7 +806,7 @@ function getLiveStatus() {
  * because a scan that has already recorded thousands of files must never be lost to
  * one bad API call.
  */
-function processFolder(inputUrl) {
+function processFolder(inputUrl, maxMs) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(LOCK_WAIT)) {
     logIt('processFolder busy', 'could not get the lock in ' + (LOCK_WAIT / 1000) + 's');
@@ -626,7 +814,9 @@ function processFolder(inputUrl) {
   }
   try {
     const props = PropertiesService.getScriptProperties();
-    const deadline = Date.now() + MAX_RUNTIME;
+    // maxMs lets the background runner shorten a slice so it cannot overshoot its daily
+    // budget; the dialog never passes it and gets the full soft deadline.
+    const deadline = Date.now() + Math.min(MAX_RUNTIME, Number(maxMs) || MAX_RUNTIME);
 
     let phase = props.getProperty(P_PHASE);
     if (!phase) {
@@ -1219,6 +1409,7 @@ function getState() {
     return {
       phase: props.getProperty(P_PHASE) || '',
       linksPending: !!props.getProperty(P_LINKS_FROM),
+      background: backgroundInfo(),
       rootUrl: rootId ? 'https://drive.google.com/drive/folders/' + rootId : '',
       scannedFiles: filesSh ? Math.max(0, filesSh.getLastRow() - 1) : 0,
       dupeTotal: total,

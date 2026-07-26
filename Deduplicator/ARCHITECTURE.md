@@ -10,8 +10,9 @@ minutes**. There is no long-running process, no background worker, and no durabl
 in-process memory. Every unit of work must therefore be (a) decomposable into sub-6-minute
 slices, (b) checkpointed to durable storage between slices, and (c) resumable in O(1) — not
 by replaying from the beginning. The architecture is essentially a *hand-rolled resumable
-job runner* built out of a spreadsheet, three key–value stores, and a browser tab that acts
-as the scheduler.
+job runner* built out of a spreadsheet, three key–value stores, and **one of two
+interchangeable schedulers**: a browser tab, or a time-driven trigger (§4). Because the
+schedulers hold no state, either can pick up a job the other started.
 
 ---
 
@@ -44,8 +45,12 @@ graph TB
     LOCK["LockService<br/>one job at a time"]
   end
 
+  TRIG["Time-driven trigger<br/>backgroundScanTick every 5 min<br/>no browser required"]
   DRIVE["Drive API v3<br/>metadata only"]
 
+  TRIG -->|"scan + compare only,<br/>never trash"| SCAN
+  TRIG --> DEC
+  TRIG --> PROPS
   SCHED -->|google.script.run| SCAN
   SCHED --> CMP
   SCHED --> TRASH
@@ -68,6 +73,7 @@ graph TB
 | Component | Owns | Deliberately does *not* own |
 |---|---|---|
 | `Progress.html` | Scheduling (when to call again), retry policy, contention back-off, user intent | Any state worth keeping — it is disposable; closing the tab loses nothing |
+| `backgroundScanTick` | The same scheduling role without a browser: one slice per trigger firing, plus its own daily runtime budget | Trashing — nothing irreversible runs unattended |
 | `processFolder` | One slice of work; phase transitions; converting every failure into a resumable reply | Deciding *how many* slices are needed |
 | `scanUntilDeadline` | BFS frontier advance, batched appends, checkpoint on exit | Duplicate detection, de-duplication of records |
 | `runDeduplication` | Grouping, keeper selection, result materialisation, status/override carry-over | Trashing, and anything irreversible |
@@ -137,7 +143,7 @@ Three properties make the key trustworthy:
 2. **Size is a co-discriminator.** MD5 alone is collision-prone under adversarial input;
    pairing it with the exact byte size makes an accidental false match effectively
    impossible for non-adversarial data. (Adversarial MD5 collisions *with equal size* are
-   constructible — see §7 Risks.)
+   constructible — see §8 Risks.)
 3. **Absence is handled explicitly.** Google-native files (Docs/Sheets/Slides) have no
    `md5Checksum`, and zero-byte files match each other trivially. Both are recorded and
    **excluded from detection** rather than guessed at.
@@ -337,7 +343,74 @@ tool safe to interrupt at any point:
    read-only with respect to Drive; `trashDuplicates` is the sole irreversible step, and it
    is gated behind an explicit confirmation and a per-row audit mark.
 
-## 4. Time budget and how work is sliced
+## 4. The two schedulers — attended and unattended
+
+Nothing in the server keeps a job moving; something has to ask for the next slice. There are
+two things that can do that, and they are interchangeable because **neither holds state**.
+
+| | Dialog (`Progress.html`) | Time-driven trigger (`backgroundScanTick`) |
+|---|---|---|
+| Requires | An open browser tab, machine awake | Nothing — runs on Google's servers |
+| Cadence | Immediately after each reply (3 s gap) | Every `BG_EVERY_MINUTES` = 5 min |
+| Duty cycle | ~100 % while open | ~90 % (4.5 min of work per 5 min) |
+| Can trash | **Yes**, on explicit confirmation | **No, by design** |
+| Runtime budget | The account's own daily quota | Additionally capped at `BG_DAILY_BUDGET_MS` = 5 h/day |
+| Stops when | The tab closes or the job finishes | The job finishes, a pause is requested, or the daily cap is hit |
+
+### Why the trigger will not trash
+
+Discovery, comparison and decoration are all reversible: they read Drive and write a derived
+sheet. Trashing is the one irreversible step, and it is the one thing that should never happen
+while nobody is watching — a mistaken keeper choice discovered the next morning is worth far
+less than one caught before confirming. So `backgroundScanTick` drives the scan, the compare
+and the decoration, then removes its own trigger and leaves the sheet for a human. The harness
+asserts this directly: no tick ever calls `setTrashed`.
+
+### Yielding to the reviewer
+
+Both schedulers can be active at once, which raises two conflicts, both resolved in favour of
+the person:
+
+1. **Lock contention** — whichever arrives second gets `busyReply` and simply waits. Already
+   the general mechanism (§9), so the trigger needed nothing new.
+2. **A pause request** — `processFolder` clears the pause flag at the start of a run, so a
+   naive trigger would undo a reviewer's *Pause & Compare* on its next firing. `backgroundScanTick`
+   therefore checks `pauseRequested()` **before** calling anything and, if set, uninstalls its
+   own trigger. Pausing is thus also the way to take back manual control.
+
+### The daily budget, and why it is self-imposed
+
+Google gives Workspace accounts roughly **6 h/day** of trigger runtime. Spending all of it
+would starve the owner's other scheduled scripts, which draw on the same per-user pool. So the
+runner keeps its own ledger — `BG_DAY` plus `BG_USED_MS` in properties, wall-clock per tick,
+reset when the date rolls over in the script's timezone — and stops working at **5 h**, leaving
+about an hour. Two details:
+
+- **The cap does not uninstall the trigger.** Ticks keep firing and returning immediately
+  (a second or so each), so work resumes by itself after midnight with no human action.
+- **A tick can also be *shortened*.** `processFolder(url, maxMs)` accepts a slice length, so
+  the last tick before the cap trims its own deadline rather than overshooting.
+
+The ledger measures only this runner. Other scripts' consumption is invisible to it — which is
+precisely why the budget sits below the platform ceiling rather than at it.
+
+### Handing a job to another account
+
+Because `ScriptProperties`, `CacheService` and `LockService` are **script-scoped, not
+user-scoped**, a second account with edit access to the spreadsheet resumes exactly where the
+first left off: same cursor, same page token, same `Duplicates` rows. Quotas, however, are
+**per user**, so a colleague continuing the scan draws on their own daily budget. This makes
+account hand-off a legitimate way to get past an exhausted quota.
+
+Two caveats:
+
+- **Triggers belong to the account that installed them.** A background run set up by A keeps
+  running as A and counts against A's quota; B must install their own.
+- **Trashing needs permission on each file.** Scanning only requires read access, but
+  `setTrashed` on a file B does not own can fail. Those rows come back as
+  `Error: …` in the Status column and can be retried by the owner — no silent skips.
+
+## 5. Time budget and how work is sliced
 
 | Constant | Value | Rationale |
 |---|---|---|
@@ -350,6 +423,9 @@ tool safe to interrupt at any point:
 | `LINK_CHUNK` | 500 rows | Rich-text payload per write |
 | `READ_PAGE_ROWS` | 50 000 | Caps peak memory when streaming a large sheet |
 | `LOCK_WAIT` | 20 s | Absorbs contention between consecutive slices of the same job without a client round trip |
+| `BG_EVERY_MINUTES` | 5 | Trigger cadence; one minute more than a slice, so firings do not overlap |
+| `BG_DAILY_BUDGET_MS` | 5 h | Self-imposed share of the ~6 h/day trigger pool, leaving ~1 h for other scripts |
+| `BG_MIN_SLICE_MS` | 30 s | Below this the remaining budget is not worth a tick's own overhead |
 
 ### One scan slice
 
@@ -382,14 +458,14 @@ tab, a dropped connection, a laptop sleeping or a hard 6-minute kill are all the
 
 ---
 
-## 5. Complexity and capacity summary
+## 6. Complexity and capacity summary
 
 N = files, F = folders, G = distinct content groups, D = duplicate rows (D ≤ N − G).
 
 | Stage | Time | Peak memory | Durable writes | Slice-safe? |
 |---|---|---|---|---|
 | Discovery | Θ(F + N/1000) API calls, latency-bound | **Θ(F + n_slice)** — frontier, folder-ID set, and the IDs recorded *by this slice only* | N + F rows, appended in 200-row batches | Yes — cursor + page token |
-| Compare | Θ(N) expected | **Θ(N)** — see §6.1, the binding constraint | D rows, one `setValues` | Partially — values are atomic per run; decoration resumes |
+| Compare | Θ(N) expected | **Θ(N)** — see §7.1, the binding constraint | D rows, one `setValues` | Partially — values are atomic per run; decoration resumes |
 | Decoration | Θ(D) | Θ(500) per chunk | 2 rich-text writes + 1 checkbox insert per 500 rows | Yes — `LINKS_FROM` |
 | Trash | Θ(D) API calls, latency-bound | Θ(D) row snapshot | 1 status write per 50 rows | Yes — per-row `Status` |
 | Swap | Θ(rows selected) | Θ(1) | 4 cell writes per row | N/A — interactive |
@@ -406,9 +482,9 @@ Trashing is one Drive mutation per file (~200–500 ms) and cannot be batched th
 
 ---
 
-## 6. Scalability constraints — ranked by how soon they bite
+## 7. Scalability constraints — ranked by how soon they bite
 
-### 6.1 Compare-stage memory — **the binding constraint**
+### 7.1 Compare-stage memory — **the binding constraint**
 
 `runDeduplication` holds one JS object per hashed file record in `groups`. That is **Θ(N)
 resident memory** inside a single execution:
@@ -433,7 +509,7 @@ Two escape hatches if N approaches 5 × 10⁵, in increasing order of effort:
    effectively O(1). This is the design to adopt if this tool is ever pointed at a
    million-file corpus.
 
-### 6.2 Per-slice startup cost that scales with the job
+### 7.2 Per-slice startup cost that scales with the job
 
 Each scan slice re-reads `_scan_queue` to rebuild the frontier and its folder-ID set: **Θ(F)
 per slice**. At F = 20 000 that is ~40 000 cells, one to three seconds — acceptable against a
@@ -451,7 +527,7 @@ reported as a duplicate *of itself*. `runDeduplication` de-duplicates by file ID
 in; the test suite asserts this for both mechanisms that produce repeats (stale-page-token
 re-listing, and a file reachable through two parents).
 
-### 6.3 Spreadsheet capacity — 10 million cells, shared
+### 7.3 Spreadsheet capacity — 10 million cells, shared
 
 | Sheet | Cells | At N = 100k / F = 20k / D = 10k |
 |---|---|---|
@@ -464,7 +540,7 @@ Headroom is large: the hard wall is around **N ≈ 1.5 M files**. Note the quota
 per-*spreadsheet*, so the checkpoint sheets and the human-facing result compete for the same
 budget — reviewer-added helper columns count too.
 
-### 6.4 Platform quotas — the constraint people forget
+### 7.4 Platform quotas — the constraint people forget
 
 The deployment in question runs under **Google Workspace Business Standard**. Verify against
 current Google documentation before relying on any figure; these change.
@@ -473,6 +549,7 @@ current Google documentation before relying on any figure; these change.
 |---|---|---|---|
 | Runtime per execution | 6 min | 6 min | Architected around |
 | **Total script runtime / day** | ~90 min | **~6 h** | At ~6 h, a projected 2–4 h scan plus ~1 h of trashing fits inside one day with headroom. On a consumer account the same job would stop mid-way and resume the next day |
+| **Trigger runtime / day** | ~90 min | **~6 h** | The pool the background runner draws on. `BG_DAILY_BUDGET_MS` caps *our* share at 5 h so other scheduled scripts keep about an hour |
 | Simultaneous executions | 30 | 30 | We hold one, plus the client's next call |
 | Drive API requests | ~1 000 / 100 s / user | same | Θ(F + N/1000) calls spread over hours is far below this |
 | Properties value / total | 9 KB / 500 KB | same | Why bulk state is in sheets |
@@ -482,7 +559,14 @@ The daily-runtime ceiling is what can turn "unattended overnight" into "several 
 not a failure mode — the checkpoint simply waits — but it is a planning input, and it is the
 quota most likely to be forgotten when this tool is copied to another account tier.
 
-### 6.5 Latency floors that no amount of code removes
+**Tier note.** The published figures split by *account type*, not by Workspace edition:
+consumer Gmail on one side, Google Workspace on the other. **Business Starter and Business
+Standard therefore carry the same ~6 h/day**, as do Enterprise and Education. The difference
+between those editions lies in storage and features, not Apps Script runtime. Since the quota
+pool is **per user**, an exhausted budget can also be worked around by continuing from a second
+account with access — see §4, *Handing a job to another account*.
+
+### 7.5 Latency floors that no amount of code removes
 
 Discovery is ~1 API round trip per folder; trashing is exactly 1 per file. Both are bound by
 Drive's response time, not by our CPU. The only lever is fewer round trips (already at
@@ -492,7 +576,7 @@ contend for the same lock and checkpoint.
 
 ---
 
-## 7. Correctness invariants and risk register
+## 8. Correctness invariants and risk register
 
 ### Invariants the implementation guarantees
 
@@ -511,7 +595,7 @@ contend for the same lock and checkpoint.
 | Risk | Severity | Status |
 |---|---|---|
 | **MD5 + size collision on adversarial input** | Data loss | Accepted. Chosen-prefix MD5 collisions with equal length are constructible; two *deliberately crafted* files would be judged identical. Irrelevant for organic document corpora; unacceptable if this were ever pointed at untrusted uploads, where SHA-256 (requiring content download) would be needed |
-| Compare-stage memory at N ≫ 2 × 10⁵ | Job cannot complete | Mitigations designed, not implemented (§6.1) |
+| Compare-stage memory at N ≫ 2 × 10⁵ | Job cannot complete | Mitigations designed, not implemented (§7.1) |
 | Clearing the `Duplicates` sheet erases reviewer overrides | Data loss on a *subsequent* compare+trash | Documented in README; overrides live only in that sheet |
 | Hand-editing `_scan_queue` | Silent under-reporting | `QUEUE_CURSOR` is positional; deleting rows above it shifts the walk. Documented; `Reset Scan Progress` is the supported path |
 | Daily runtime quota exhaustion | Schedule slip only | Inherent; checkpoint waits |
@@ -519,7 +603,7 @@ contend for the same lock and checkpoint.
 
 ---
 
-## 8. Coordination: why three different stores
+## 9. Coordination: why three different stores
 
 | Store | Holds | Why not one of the others |
 |---|---|---|
@@ -536,7 +620,7 @@ blip without a human deciding anything.
 
 ---
 
-## 9. Where to look in the code
+## 10. Where to look in the code
 
 | Concern | Symbol |
 |---|---|
@@ -545,6 +629,7 @@ blip without a human deciding anything.
 | Hash bucketing, keeper choice | `runDeduplication`, `pickKeeper` |
 | Streaming a large sheet | `forEachDataRow` |
 | Resumable cosmetics | `decorateRows`, `finishPendingLinks`, `lastDuplicateRow`, `linkRuns` |
+| Unattended scheduling | `setBackgroundScan`, `backgroundScanTick`, `bgBudget`, `bgSpend`, `removeBackgroundTriggers`, `backgroundInfo` |
 | Irreversible stage | `trashDuplicates` |
 | Reviewer overrides | `onEdit`, `swapSelectedRows`, `selectedDataRows`, `swapKeeper`, `readPairChoices` |
 | Resilience primitives | `withRetry`, `isTransient`, `describeError`, `busyReply` |
@@ -554,26 +639,31 @@ blip without a human deciding anything.
 
 ---
 
-## 10. Verification approach
+## 11. Verification approach
 
 The logic is exercised against a **fake Sheets/Drive API** (an in-memory sheet model with
-ranges, rich text, checkboxes, filters and selections) so that column layouts, the keeper
-rule, swap semantics, repeat collapsing, status carry-over, layout migration and deferred
-decoration are all asserted without touching a real spreadsheet — currently 61 assertions.
+ranges, rich text, checkboxes, filters and selections, plus a fake trigger registry) so that
+column layouts, the keeper rule, swap semantics, repeat collapsing, status carry-over, layout
+migration, deferred decoration and the background runner's lifecycle are all asserted without
+touching a real spreadsheet — currently 91 assertions.
+
+Notable among them, because they encode promises rather than mechanics: a repeated file record
+is never reported as a duplicate of itself; a swap of every row in a family over-keeps instead
+of destroying; and **no background tick ever calls `setTrashed`**.
 
 Two limits worth stating plainly: the harness models the API's *contract*, not Google's
-performance, so **no memory or timing claim in §6 is measured** — those are reasoned
-estimates, and the 2 × 10⁵ threshold in §6.1 in particular is an untested projection. And
+performance, so **no memory or timing claim in §7 is measured** — those are reasoned
+estimates, and the 2 × 10⁵ threshold in §7.1 in particular is an untested projection. And
 the harness is a development artefact, not part of the deployed script.
 
 ---
 
-## 11. If this were rebuilt at 10× scale
+## 12. If this were rebuilt at 10× scale
 
 The current design is the right shape for 10⁵ files inside Apps Script. Beyond ~10⁶, the
 platform — not the algorithm — is the wrong host:
 
-1. **Sort-then-stream the compare** (§6.1) — the single highest-value change, and it fits
+1. **Sort-then-stream the compare** (§7.1) — the single highest-value change, and it fits
    the current architecture.
 2. **Move discovery to Drive's `changes`/incremental listing** so re-scans are deltas rather
    than full walks. Today a second run over the same tree costs the same as the first.
