@@ -145,6 +145,25 @@ self-clearing by construction — an execution cannot hold the lock past the 6-m
 Nothing was ever at risk: Status is written per row as the run proceeds, so clicking the
 button again always continues rather than repeating.
 
+**v5.4.2** — the menu swap respects filters. Filtering the Duplicates sheet, selecting the
+visible rows and running **🚀 Angel → Keep Duplicate Instead** used to swap **every row in
+the selected span**, including everything the filter had hidden: a filtered result looks
+contiguous but its row range covers the hidden rows between. Ctrl-clicking several blocks
+was wrong in the other direction — `getActiveRange()` returns only one range, so the rest
+were silently ignored.
+
+`selectedDataRows` now walks every range of `getActiveRangeList()`, de-duplicates
+overlapping ranges (a swap is its own inverse, so swapping a row twice would undo it),
+clamps to real data, and skips any row hidden by a filter or by hand — reporting them as
+*"340 hidden row(s) skipped"* instead of acting on them. The **Swap ⇄** checkbox was never
+affected: `onEdit` only ever acts on rows whose box is actually ticked.
+
+Recovering from a swap made in error: a swap only rewrites cells, so nothing in Drive has
+moved. Rows where **Duplicate Date is newer than Original Date** are the swapped ones
+(`=IF(D2="","",D2>H2)` flags them), and re-running the swap on the same rows flips them
+back. Note that `Ctrl+Z` cannot undo a script's edits, and a re-compare deliberately
+*keeps* swaps, so it will not clean them up either.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.

@@ -178,6 +178,11 @@ function onEdit(e) {
 /**
  * Menu twin of the checkbox, for the whole current selection. Useful for flipping many
  * rows at once, and as a fallback if the simple trigger is ever unavailable.
+ *
+ * Rows hidden by a filter are never touched. Selecting a filtered result looks like a
+ * contiguous block but its row range spans everything the filter hid, so acting on the
+ * span would swap rows the reviewer cannot even see — the opposite of what selecting
+ * them means.
  */
 function swapSelectedRows() {
   const ui = SpreadsheetApp.getUi();
@@ -185,21 +190,56 @@ function swapSelectedRows() {
   if (sh.getName() !== DUPES_SHEET) {
     return ui.alert('Select the rows to swap in the "' + DUPES_SHEET + '" sheet first.');
   }
-  const sel = sh.getActiveRange();
-  const first = Math.max(2, sel.getRow());
-  // Clamp to real data, so selecting whole columns does not "skip" a thousand blanks.
-  const last = Math.min(sel.getRow() + sel.getNumRows() - 1, sh.getLastRow());
+  const sel = selectedDataRows(sh);
   let swapped = 0, blocked = 0, bad = 0;
-  for (let row = first; row <= last; row++) {
+  sel.rows.forEach(row => {
     const outcome = swapKeeper(sh, row);
     if (outcome === 'OK') swapped++;
     else if (outcome === 'TRASHED') blocked++;
     else bad++;
-  }
+  });
   ui.alert(swapped + ' row(s) swapped: the file listed as "Original" is now the one that ' +
            'will be trashed.' +
+           (sel.hidden ? '\n' + sel.hidden + ' hidden row(s) skipped (filtered or hidden by hand).' : '') +
            (blocked ? '\n' + blocked + ' row(s) skipped — already trashed.' : '') +
            (bad ? '\n' + bad + ' row(s) skipped — no usable links in the row.' : ''));
+}
+
+/**
+ * The data rows a reviewer actually selected: every range of the selection (Ctrl-clicking
+ * several blocks makes getActiveRange return only one of them, which used to mean the
+ * others were silently ignored), de-duplicated where ranges overlap, clamped to real data
+ * so selecting whole columns does not walk a thousand blanks, and with hidden rows
+ * reported separately rather than acted on.
+ */
+function selectedDataRows(sh) {
+  const lastData = sh.getLastRow();
+  const ranges = sh.getActiveRangeList ? sh.getActiveRangeList().getRanges() : [sh.getActiveRange()];
+  const seen = {};
+  const rows = [];
+  let hidden = 0;
+
+  ranges.forEach(r => {
+    const from = Math.max(2, r.getRow());
+    const to = Math.min(r.getRow() + r.getNumRows() - 1, lastData);
+    for (let row = from; row <= to; row++) {
+      if (seen[row]) continue;
+      seen[row] = true;
+      if (isRowHidden(sh, row)) hidden++;
+      else rows.push(row);
+    }
+  });
+
+  rows.sort((a, b) => a - b);
+  return { rows: rows, hidden: hidden };
+}
+
+function isRowHidden(sh, row) {
+  try {
+    return sh.isRowHiddenByFilter(row) || sh.isRowHiddenByUser(row);
+  } catch (e) {
+    return false;      // both calls are long-standing API; the guard is belt and braces
+  }
 }
 
 /**
