@@ -219,6 +219,18 @@ in two different branches — would never be found, and that is the most common 
 accumulated duplication. The 800 GB is irrelevant: no file is ever downloaded, only
 metadata, so file and folder *counts* are the only thing that scales.
 
+**v5.6** — a `Copies` column, right after `Size`. A duplicate row said nothing about how large
+its family was: a row could be one of two or one of nine, and the only way to tell was to
+count neighbours sharing a hash. `Copies` now states the family size (keeper included) on
+every row of it, which matters because the swap rule is *one row per family* — see
+[ARCHITECTURE.md §2.3](ARCHITECTURE.md).
+
+`Copies` and `Size` are also written back as **real numbers** rather than text. `appendRows`
+forces the block to plain text so a file named `=total.xlsx` cannot become a formula; correct
+for names, wrong for numerics, where it makes `"9" > "10"` and breaks filter-by-number. Both
+columns are rewritten with a numeric format after the append (`numberColumn`), so sorting by
+size and filtering for `Copies > 2` behave as expected.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -277,7 +289,7 @@ two cross-execution signals — the live status (`STATUS`) and the pause request
 |-------|---------|------|
 | `_scan_files` | File ID, Name, Size, Path, Hash, Date | append-only record of every file seen |
 | `_scan_queue` | Folder ID, Path | the folder frontier + a cursor into it |
-| `Duplicates` | Duplicate Name/Link/Path/Date, Original Name/Link/Path/Date, Size, Duplicate ID, Hash, Status, Swap ⇄ | the reviewable result |
+| `Duplicates` | Duplicate Name/Link/Path/Date, Original Name/Link/Path/Date, Size, Copies, Duplicate ID, Hash, Status, Swap ⇄ | the reviewable result |
 
 > **Why not `ScriptProperties`?** A single property value is capped at **9 KB** — about
 > 40 file records. v4 checkpointed the whole file list into one property, so every scan

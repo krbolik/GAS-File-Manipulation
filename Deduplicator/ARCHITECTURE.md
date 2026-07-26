@@ -137,7 +137,7 @@ Three properties make the key trustworthy:
 2. **Size is a co-discriminator.** MD5 alone is collision-prone under adversarial input;
    pairing it with the exact byte size makes an accidental false match effectively
    impossible for non-adversarial data. (Adversarial MD5 collisions *with equal size* are
-   constructible — see §6 Risks.)
+   constructible — see §7 Risks.)
 3. **Absence is handled explicitly.** Google-native files (Docs/Sheets/Slides) have no
    `md5Checksum`, and zero-byte files match each other trivially. Both are recorded and
    **excluded from detection** rather than guessed at.
@@ -150,20 +150,24 @@ each pointing at it.
 
 For a group of 5 copies where `E` is the newest:
 
-| Row | Duplicate (gets trashed) | Original (survives) | Hash | Status |
-|---|---|---|---|---|
-| 1 | A | E | `9f2c…` | |
-| 2 | B | E | `9f2c…` | |
-| 3 | C | E | `9f2c…` | |
-| 4 | D | E | `9f2c…` | |
+| Row | Duplicate (gets trashed) | Original (survives) | Copies | Hash | Status |
+|---|---|---|---|---|---|
+| 1 | A | E | 5 | `9f2c…` | |
+| 2 | B | E | 5 | `9f2c…` | |
+| 3 | C | E | 5 | `9f2c…` | |
+| 4 | D | E | 5 | `9f2c…` | |
 
 Consequences worth being explicit about:
 
 - **Row count is n − 1, never n(n−1)/2.** A group of 5 produces 4 rows, not 10. The star
   shape is what makes the sheet reviewable: no pair matrix, and the surviving copy is stated
   on every row rather than inferred.
+- **`Copies` states the family size** (keeper included) on every row of it, so a row is
+  visibly "one of five" rather than something to infer by counting neighbours. It is written
+  as a real number, not text, so filtering for `Copies > 2` — the families where the one-swap
+  rule matters — works.
 - **The `Hash` column is the group identity.** There is no group-ID column; sorting or
-  filtering on `Hash` (column K) collects a family, and the repeated Original columns confirm
+  filtering on `Hash` (column L) collects a family, and the repeated Original columns confirm
   they share a keeper.
 - **Rows of a group are written adjacently**, because emission iterates group by group.
   Sorting the sheet afterwards is safe — see below.
@@ -253,7 +257,87 @@ page of 1000 children. This, not CPU, is the wall-clock cost of the scan.
 
 ---
 
-## 3. Time budget and how work is sliced
+## 3. Operational flow — which sheet is used when, and what each decision touches
+
+The three sheets are not interchangeable stores; they form a pipeline, and each stage reads
+the one behind it. `_scan_queue` drives discovery, `_scan_files` is the immutable record
+discovery produces, and `Duplicates` is a *derived, disposable view* of `_scan_files` that
+doubles as the reviewer's workspace and the audit trail.
+
+```mermaid
+flowchart TD
+  OPEN([Reviewer opens the dialog]) --> ST["getState<br/>reads Duplicates + properties"]
+  ST --> WHAT{"What does the reviewer do?"}
+
+  WHAT -->|"Analyze Folder<br/>(new URL)"| FRESH["startFreshScan<br/>CLEARS _scan_files + Duplicates<br/>seeds _scan_queue with the root"]
+  WHAT -->|"Resume Scan"| SLICE
+  FRESH --> SLICE
+
+  SLICE["scanUntilDeadline — one ≤4.5 min slice<br/>read frontier from _scan_queue at QUEUE_CURSOR"]
+  SLICE --> DRIVE["Drive Files.list<br/>metadata only, 1000 per page"]
+  DRIVE --> APPEND["append files → _scan_files<br/>append new folders → _scan_queue<br/>checkpoint QUEUE_CURSOR + PAGE_TOKEN"]
+  APPEND --> DONE{"Frontier<br/>exhausted?"}
+  DONE -->|"no — deadline hit"| SLICE
+  DONE -->|"no — pause requested"| PAUSED(["Paused<br/>cursor holds the position"])
+  DONE -->|yes| CMP
+
+  WHAT -->|"Pause &amp; Compare"| PAUSEREQ["requestPause → cache flag<br/>slice stops at a folder boundary"]
+  PAUSEREQ --> PAUSED
+  PAUSED --> CMP
+  WHAT -->|"Compare Files Scanned So Far"| CMP
+
+  CMP["runDeduplication<br/>streams _scan_files, buckets by md5+size,<br/>picks the newest per family"]
+  CMP -.->|"carries forward, keyed by ID and by pair"| CARRY["Status of trashed rows<br/>+ reviewer swaps<br/>read from the OLD Duplicates rows"]
+  CARRY --> WRITE
+  WRITE["REWRITES Duplicates<br/>one row per redundant copy"]
+  WRITE --> DEC["decorateRows<br/>links + checkboxes, resumable via LINKS_FROM"]
+  DEC --> REVIEW
+
+  REVIEW{"Reviewer works the sheet"}
+  REVIEW -->|"Swap ⇄ / menu swap"| SWAP["swapKeeper<br/>rewrites 8 cells in that row<br/>NO Drive effect"]
+  REVIEW -->|"delete a row"| DEL["excluded from this trash run only<br/>(a later compare regenerates it)"]
+  REVIEW -->|"sort / filter"| SAFE["no effect — all state is keyed<br/>by file ID, never by row position"]
+  SWAP --> REVIEW
+  DEL --> TRASH
+  SAFE --> TRASH
+  REVIEW -->|"Move Duplicates to Trash"| TRASH
+
+  TRASH["trashDuplicates<br/>every row with an empty Status"]
+  TRASH --> MUTATE["Drive: setTrashed per file<br/>write Status per 50 rows"]
+  MUTATE --> LEFT{"Rows left<br/>before deadline?"}
+  LEFT -->|yes| TRASH
+  LEFT -->|no| END(["Done — Status column is the audit trail"])
+
+  WHAT -->|"Reset Scan Progress"| RESET["CLEARS all three sheets,<br/>properties and cache"]
+  RESET --> OPEN
+```
+
+### What each reviewer decision actually touches
+
+| Decision | Code path | Sheets / stores written | Drive effect | Reversible? |
+|---|---|---|---|---|
+| **Analyze Folder** (new URL) | `startFreshScan` → `seedQueue` | Clears `_scan_files` **and** `Duplicates`; seeds `_scan_queue`; sets `ROOT_ID`, `QUEUE_CURSOR`, `PHASE` | None | Destroys prior scan + review state |
+| **Resume Scan** | `processFolder` → `scanUntilDeadline` | Appends to `_scan_files` / `_scan_queue`; advances `QUEUE_CURSOR`, `PAGE_TOKEN` | Reads only | N/A — additive |
+| **Pause & Compare** | `requestPause` (cache) → next slice returns `PAUSED` → `compareScannedSoFar` | Rewrites `Duplicates` | None | Yes — `Resume Scan` continues |
+| **Compare Files Scanned So Far** (menu) | `compareScannedSoFar` | Rewrites `Duplicates`, preserving `Status` + swaps | None | Yes — idempotent |
+| **Swap ⇄** (checkbox or menu) | `onEdit` / `swapSelectedRows` → `swapKeeper` | 8 cells + ID + `Status` clear, in that row only | **None** | Yes — swap again to revert |
+| **Delete a row by hand** | — | `Duplicates` only | None | Only until the next compare, which regenerates it |
+| **Sort / filter the sheet** | — | Nothing | None | Yes — no state is positional |
+| **Move Duplicates to Trash** | `trashDuplicates` | `Status` per row, batched 50 | **Trashes files** | Only via Drive Trash |
+| **Reset Scan Progress** | `resetToken` | Clears all three sheets + all properties + cache | None | **No** — the scan and the audit trail are gone |
+
+Two properties of this pipeline are worth stating explicitly, because they are what make the
+tool safe to interrupt at any point:
+
+1. **`Duplicates` is derived, and rewritten wholesale on every compare.** Nothing is
+   *incrementally* maintained there. What survives a rewrite does so by being re-derived:
+   `Status` by file ID, swaps by unordered pair. Everything else — row order, deleted rows,
+   helper columns' meaning — does not.
+2. **Only one stage mutates Drive.** Discovery, comparison, decoration and swapping are all
+   read-only with respect to Drive; `trashDuplicates` is the sole irreversible step, and it
+   is gated behind an explicit confirmation and a per-row audit mark.
+
+## 4. Time budget and how work is sliced
 
 | Constant | Value | Rationale |
 |---|---|---|
@@ -298,14 +382,14 @@ tab, a dropped connection, a laptop sleeping or a hard 6-minute kill are all the
 
 ---
 
-## 4. Complexity and capacity summary
+## 5. Complexity and capacity summary
 
 N = files, F = folders, G = distinct content groups, D = duplicate rows (D ≤ N − G).
 
 | Stage | Time | Peak memory | Durable writes | Slice-safe? |
 |---|---|---|---|---|
 | Discovery | Θ(F + N/1000) API calls, latency-bound | **Θ(F + n_slice)** — frontier, folder-ID set, and the IDs recorded *by this slice only* | N + F rows, appended in 200-row batches | Yes — cursor + page token |
-| Compare | Θ(N) expected | **Θ(N)** — see §5.1, the binding constraint | D rows, one `setValues` | Partially — values are atomic per run; decoration resumes |
+| Compare | Θ(N) expected | **Θ(N)** — see §6.1, the binding constraint | D rows, one `setValues` | Partially — values are atomic per run; decoration resumes |
 | Decoration | Θ(D) | Θ(500) per chunk | 2 rich-text writes + 1 checkbox insert per 500 rows | Yes — `LINKS_FROM` |
 | Trash | Θ(D) API calls, latency-bound | Θ(D) row snapshot | 1 status write per 50 rows | Yes — per-row `Status` |
 | Swap | Θ(rows selected) | Θ(1) | 4 cell writes per row | N/A — interactive |
@@ -322,9 +406,9 @@ Trashing is one Drive mutation per file (~200–500 ms) and cannot be batched th
 
 ---
 
-## 5. Scalability constraints — ranked by how soon they bite
+## 6. Scalability constraints — ranked by how soon they bite
 
-### 5.1 Compare-stage memory — **the binding constraint**
+### 6.1 Compare-stage memory — **the binding constraint**
 
 `runDeduplication` holds one JS object per hashed file record in `groups`. That is **Θ(N)
 resident memory** inside a single execution:
@@ -349,7 +433,7 @@ Two escape hatches if N approaches 5 × 10⁵, in increasing order of effort:
    effectively O(1). This is the design to adopt if this tool is ever pointed at a
    million-file corpus.
 
-### 5.2 Per-slice startup cost that scales with the job
+### 6.2 Per-slice startup cost that scales with the job
 
 Each scan slice re-reads `_scan_queue` to rebuild the frontier and its folder-ID set: **Θ(F)
 per slice**. At F = 20 000 that is ~40 000 cells, one to three seconds — acceptable against a
@@ -367,20 +451,20 @@ reported as a duplicate *of itself*. `runDeduplication` de-duplicates by file ID
 in; the test suite asserts this for both mechanisms that produce repeats (stale-page-token
 re-listing, and a file reachable through two parents).
 
-### 5.3 Spreadsheet capacity — 10 million cells, shared
+### 6.3 Spreadsheet capacity — 10 million cells, shared
 
 | Sheet | Cells | At N = 100k / F = 20k / D = 10k |
 |---|---|---|
 | `_scan_files` | 6 × N | 600 000 |
 | `_scan_queue` | 2 × F | 40 000 |
-| `Duplicates` | 13 × D | 130 000 |
+| `Duplicates` | 14 × D | 140 000 |
 | **Total** | | **~0.8 M of 10 M (8 %)** |
 
 Headroom is large: the hard wall is around **N ≈ 1.5 M files**. Note the quota is
 per-*spreadsheet*, so the checkpoint sheets and the human-facing result compete for the same
 budget — reviewer-added helper columns count too.
 
-### 5.4 Platform quotas — the constraint people forget
+### 6.4 Platform quotas — the constraint people forget
 
 The deployment in question runs under **Google Workspace Business Standard**. Verify against
 current Google documentation before relying on any figure; these change.
@@ -398,7 +482,7 @@ The daily-runtime ceiling is what can turn "unattended overnight" into "several 
 not a failure mode — the checkpoint simply waits — but it is a planning input, and it is the
 quota most likely to be forgotten when this tool is copied to another account tier.
 
-### 5.5 Latency floors that no amount of code removes
+### 6.5 Latency floors that no amount of code removes
 
 Discovery is ~1 API round trip per folder; trashing is exactly 1 per file. Both are bound by
 Drive's response time, not by our CPU. The only lever is fewer round trips (already at
@@ -408,7 +492,7 @@ contend for the same lock and checkpoint.
 
 ---
 
-## 6. Correctness invariants and risk register
+## 7. Correctness invariants and risk register
 
 ### Invariants the implementation guarantees
 
@@ -427,7 +511,7 @@ contend for the same lock and checkpoint.
 | Risk | Severity | Status |
 |---|---|---|
 | **MD5 + size collision on adversarial input** | Data loss | Accepted. Chosen-prefix MD5 collisions with equal length are constructible; two *deliberately crafted* files would be judged identical. Irrelevant for organic document corpora; unacceptable if this were ever pointed at untrusted uploads, where SHA-256 (requiring content download) would be needed |
-| Compare-stage memory at N ≫ 2 × 10⁵ | Job cannot complete | Mitigations designed, not implemented (§5.1) |
+| Compare-stage memory at N ≫ 2 × 10⁵ | Job cannot complete | Mitigations designed, not implemented (§6.1) |
 | Clearing the `Duplicates` sheet erases reviewer overrides | Data loss on a *subsequent* compare+trash | Documented in README; overrides live only in that sheet |
 | Hand-editing `_scan_queue` | Silent under-reporting | `QUEUE_CURSOR` is positional; deleting rows above it shifts the walk. Documented; `Reset Scan Progress` is the supported path |
 | Daily runtime quota exhaustion | Schedule slip only | Inherent; checkpoint waits |
@@ -435,7 +519,7 @@ contend for the same lock and checkpoint.
 
 ---
 
-## 7. Coordination: why three different stores
+## 8. Coordination: why three different stores
 
 | Store | Holds | Why not one of the others |
 |---|---|---|
@@ -452,7 +536,7 @@ blip without a human deciding anything.
 
 ---
 
-## 8. Where to look in the code
+## 9. Where to look in the code
 
 | Concern | Symbol |
 |---|---|
@@ -470,7 +554,7 @@ blip without a human deciding anything.
 
 ---
 
-## 9. Verification approach
+## 10. Verification approach
 
 The logic is exercised against a **fake Sheets/Drive API** (an in-memory sheet model with
 ranges, rich text, checkboxes, filters and selections) so that column layouts, the keeper
@@ -478,18 +562,18 @@ rule, swap semantics, repeat collapsing, status carry-over, layout migration and
 decoration are all asserted without touching a real spreadsheet — currently 61 assertions.
 
 Two limits worth stating plainly: the harness models the API's *contract*, not Google's
-performance, so **no memory or timing claim in §5 is measured** — those are reasoned
-estimates, and the 2 × 10⁵ threshold in §5.1 in particular is an untested projection. And
+performance, so **no memory or timing claim in §6 is measured** — those are reasoned
+estimates, and the 2 × 10⁵ threshold in §6.1 in particular is an untested projection. And
 the harness is a development artefact, not part of the deployed script.
 
 ---
 
-## 10. If this were rebuilt at 10× scale
+## 11. If this were rebuilt at 10× scale
 
 The current design is the right shape for 10⁵ files inside Apps Script. Beyond ~10⁶, the
 platform — not the algorithm — is the wrong host:
 
-1. **Sort-then-stream the compare** (§5.1) — the single highest-value change, and it fits
+1. **Sort-then-stream the compare** (§6.1) — the single highest-value change, and it fits
    the current architecture.
 2. **Move discovery to Drive's `changes`/incremental listing** so re-scans are deltas rather
    than full walks. Today a second run over the same tree costs the same as the first.

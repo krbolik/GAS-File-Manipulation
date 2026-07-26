@@ -46,7 +46,7 @@ const QUEUE_HEADERS = ['Folder ID', 'Path'];
 // which of them is which; the raw ID sits behind them with the machine-facing columns.
 const DUPES_HEADERS = ['Duplicate Name', 'Duplicate Link', 'Duplicate Path', 'Duplicate Date',
                        'Original Name', 'Original Link', 'Original Path', 'Original Date',
-                       'Size', 'Duplicate ID', 'Hash', 'Status', 'Swap ⇄'];
+                       'Size', 'Copies', 'Duplicate ID', 'Hash', 'Status', 'Swap ⇄'];
 
 // 1-based column positions in DUPES_HEADERS, so the layout can change in one place.
 const D_COL_DUPE_NAME = 1;
@@ -58,11 +58,12 @@ const D_COL_ORIG_LINK = 6;
 const D_COL_ORIG_PATH = 7;
 const D_COL_ORIG_DATE = 8;
 const D_COL_SIZE = 9;
-const D_COL_DUPE_ID = 10;
-const D_COL_HASH = 11;
-const D_COL_STATUS = 12;
-const D_COL_SWAP = 13;
-const D_COL_DATA_WIDTH = 12;         // columns written per row; the swap box is set apart
+const D_COL_COPIES = 10;
+const D_COL_DUPE_ID = 11;
+const D_COL_HASH = 12;
+const D_COL_STATUS = 13;
+const D_COL_SWAP = 14;
+const D_COL_DATA_WIDTH = 13;         // columns written per row; the swap box is set apart
 
 /**
  * Which Drive timestamp decides the keeper. modifiedTime is the date Drive itself
@@ -71,6 +72,11 @@ const D_COL_DATA_WIDTH = 12;         // columns written per row; the swap box is
  * records per file.
  */
 const DATE_FIELD = 'modifiedTime';
+
+const COPIES_NOTE = 'How many byte-identical copies of this file exist in the scanned tree, ' +
+                    'counting the one being kept. A family of 5 copies therefore shows 5 on ' +
+                    'each of its 4 rows. Filter or sort on the Hash column to see a family ' +
+                    'together, and remember that swapping is one row per family.';
 
 const DATE_NOTE = 'The newest copy of a set of identical files is kept as the Original; ' +
                   'every older copy is listed as a Duplicate and gets trashed. The date ' +
@@ -518,6 +524,14 @@ function parseFileIdFromUrl(url) {
   return m ? m[1] : '';
 }
 
+/** Writes a column back as real numbers, undoing the plain-text blanket appendRows applies. */
+function numberColumn(sh, startRow, col, values) {
+  if (!values.length) return;
+  withRetry(() => sh.getRange(startRow, col, values.length, 1)
+                    .setNumberFormat('0')
+                    .setValues(values.map(v => [Number(v) || 0])));
+}
+
 /** One cell's worth of linkifyColumn, for the swap. */
 function linkCell(sh, row, col, url) {
   sh.getRange(row, col).setNumberFormat('@').setRichTextValue(
@@ -881,9 +895,11 @@ function runDeduplication(deadline) {
   dupesSh.setColumnWidth(D_COL_ORIG_LINK, LINK_COL_WIDTH);
   dupesSh.setColumnWidth(D_COL_DUPE_DATE, 130);
   dupesSh.setColumnWidth(D_COL_ORIG_DATE, 130);
+  dupesSh.setColumnWidth(D_COL_COPIES, 70);
   dupesSh.setColumnWidth(D_COL_SWAP, 80);
   dupesSh.getRange(1, D_COL_SWAP).setNote(SWAP_NOTE);
   dupesSh.getRange(1, D_COL_ORIG_DATE).setNote(DATE_NOTE);
+  dupesSh.getRange(1, D_COL_COPIES).setNote(COPIES_NOTE);
 
   const groups = {};
   const dupeRows = [];
@@ -923,9 +939,11 @@ function runDeduplication(deadline) {
       }
       const status = prevStatus[dupe.id] || '';
       if (status) carried++;
+      // Copies is the whole family's size, keeper included — the number a reviewer needs to
+      // see that a row is one of four, not one of one.
       dupeRows.push([dupe.name, fileUrl(dupe.id), dupe.path, showDate(dupe.date),
                      orig.name, fileUrl(orig.id), orig.path, showDate(orig.date),
-                     dupe.size, dupe.id, dupe.hash, status]);
+                     dupe.size, members.length, dupe.id, dupe.hash, status]);
     });
   });
 
@@ -934,7 +952,15 @@ function runDeduplication(deadline) {
   // the part that can run long on a big list — so it runs under the deadline and picks up
   // where it left off if it does not finish.
   const start = appendRows(dupesSh, dupeRows);
-  if (start) props.setProperty(P_LINKS_FROM, String(start));
+  if (start) {
+    // appendRows forces the block to plain text so a file named "=total.xlsx" cannot become
+    // a formula. That is wrong for the two numeric columns — as text they sort
+    // lexicographically ("9" > "10") and filter-by-number does not work — so they are
+    // rewritten as numbers afterwards.
+    numberColumn(dupesSh, start, D_COL_SIZE, dupeRows.map(r => r[D_COL_SIZE - 1]));
+    numberColumn(dupesSh, start, D_COL_COPIES, dupeRows.map(r => r[D_COL_COPIES - 1]));
+    props.setProperty(P_LINKS_FROM, String(start));
+  }
   const decorated = decorateRows(dupesSh, deadline);
 
   setStatus({ currentFile: 'Compared — ' + dupeRows.length + ' duplicates', files: distinctFiles }, true);
