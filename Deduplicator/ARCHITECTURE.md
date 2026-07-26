@@ -142,7 +142,80 @@ Three properties make the key trustworthy:
    `md5Checksum`, and zero-byte files match each other trivially. Both are recorded and
    **excluded from detection** rather than guessed at.
 
-### 2.3 Keeper selection
+### 2.3 Groups of three or more — how a multi-copy family is represented
+
+A "duplicate" is not a pair. A content group is a set of *n* byte-identical files, and the
+representation is deliberately **star-shaped, not pairwise**: one keeper, and *n − 1* rows
+each pointing at it.
+
+For a group of 5 copies where `E` is the newest:
+
+| Row | Duplicate (gets trashed) | Original (survives) | Hash | Status |
+|---|---|---|---|---|
+| 1 | A | E | `9f2c…` | |
+| 2 | B | E | `9f2c…` | |
+| 3 | C | E | `9f2c…` | |
+| 4 | D | E | `9f2c…` | |
+
+Consequences worth being explicit about:
+
+- **Row count is n − 1, never n(n−1)/2.** A group of 5 produces 4 rows, not 10. The star
+  shape is what makes the sheet reviewable: no pair matrix, and the surviving copy is stated
+  on every row rather than inferred.
+- **The `Hash` column is the group identity.** There is no group-ID column; sorting or
+  filtering on `Hash` (column K) collects a family, and the repeated Original columns confirm
+  they share a keeper.
+- **Rows of a group are written adjacently**, because emission iterates group by group.
+  Sorting the sheet afterwards is safe — see below.
+- **Groups are ephemeral, the sheet is a materialised view.** No group state is persisted
+  anywhere: `groups` exists only inside one compare execution and is recomputed
+  deterministically from `_scan_files` on the next one. Nothing to corrupt, nothing to migrate.
+
+#### The at-least-one-survivor guarantee, restated for n > 2
+
+Trashing takes the **set of distinct `Duplicate ID` values**. A group of *n* contributes at
+most *n − 1* rows, hence at most *n − 1* distinct IDs — so **at least one copy always
+survives, whatever the reviewer does**. This holds by construction, not by a check.
+
+#### Overriding the keeper in a group of 3+
+
+Swap the *one* row whose Duplicate is the copy you want to keep. Group `A B C` with `A`
+newest, rows `(B→A)` and `(C→A)`:
+
+| Action | Resulting trash set | Survivor |
+|---|---|---|
+| No swap | {B, C} | A |
+| Swap row 1 → `(A→B)` | {A, C} | B |
+| Swap row 2 → `(A→C)` | {A, B} | C |
+| **Swap both rows** | {A} — `A` is now the Duplicate on both rows | **B *and* C both survive** |
+
+The last line is the one to know: swapping *every* row of a family does not designate a
+keeper, it collapses the trash set to a single ID and leaves the family duplicated. It
+over-keeps — it never destroys — but the redundancy stays. One swap per group is the
+operation that means "keep this one instead".
+
+A swapped row can also make the sheet look self-contradictory: after swapping row 1, row 1
+says *trash A* while row 2 still calls `A` the original. Both are honoured — the trash set is
+a union — and the outcome (B survives) is correct. The `Original` column describes *that
+row's* comparison, not a global promise.
+
+#### Tracking across rebuilds
+
+Three different keys carry state across a re-compare, and none of them is a row position — so
+sorting or filtering the sheet is safe at any time:
+
+| What must survive | Keyed by | Read back by |
+|---|---|---|
+| Which copies are already trashed | `Duplicate ID` (file ID) | `readStatusByFileId` |
+| Reviewer's keeper overrides | unordered pair `{dupeId, origId}` | `readPairChoices` |
+| Group membership | `md5 + size` | recomputed, never stored |
+
+`readPairChoices` records which of the two files the sheet currently calls the duplicate and
+compares it against the date rule's default; where they disagree, the reviewer's decision
+wins. In a 3+ group this is evaluated per pair, so a single swapped row stays swapped while
+its siblings continue to follow the date rule.
+
+### 2.4 Keeper selection
 
 Within a group, the surviving copy is the one with the most recent date (`modifiedTime`,
 falling back to `createdTime`). `pickKeeper` is a single `reduce` — Θ(group size), so Θ(N)
@@ -157,7 +230,7 @@ Two tie-breaks keep the output **deterministic**, which matters because the list
 repeatedly: an undated file never beats a dated one, and an exact date tie falls back to scan
 order (`seq`).
 
-### 2.4 Discovery is breadth-first over a sheet, not recursion
+### 2.5 Discovery is breadth-first over a sheet, not recursion
 
 ```
 queue      = _scan_queue rows      (append-only; grows as folders are found)
@@ -309,19 +382,21 @@ budget — reviewer-added helper columns count too.
 
 ### 5.4 Platform quotas — the constraint people forget
 
-Verify against current Google documentation for the account tier in use; these change.
+The deployment in question runs under **Google Workspace Business Standard**. Verify against
+current Google documentation before relying on any figure; these change.
 
-| Quota | Consumer Gmail | Workspace | Relevance |
+| Quota | Consumer Gmail | **Workspace (this deployment)** | Relevance |
 |---|---|---|---|
 | Runtime per execution | 6 min | 6 min | Architected around |
-| **Total script runtime / day** | **~90 min** | **~6 h** | **A 3-hour scan is impossible on a consumer account in one day** — it will simply stop and resume tomorrow |
+| **Total script runtime / day** | ~90 min | **~6 h** | At ~6 h, a projected 2–4 h scan plus ~1 h of trashing fits inside one day with headroom. On a consumer account the same job would stop mid-way and resume the next day |
 | Simultaneous executions | 30 | 30 | We hold one, plus the client's next call |
 | Drive API requests | ~1 000 / 100 s / user | same | Θ(F + N/1000) calls spread over hours is far below this |
 | Properties value / total | 9 KB / 500 KB | same | Why bulk state is in sheets |
 | Cache value / TTL | 100 KB / 6 h | same | Status and pause flag only |
 
-The daily-runtime ceiling is the one that can turn "unattended overnight" into "several
-days". It is not a failure mode — the checkpoint simply waits — but it is a planning input.
+The daily-runtime ceiling is what can turn "unattended overnight" into "several days". It is
+not a failure mode — the checkpoint simply waits — but it is a planning input, and it is the
+quota most likely to be forgotten when this tool is copied to another account tier.
 
 ### 5.5 Latency floors that no amount of code removes
 
