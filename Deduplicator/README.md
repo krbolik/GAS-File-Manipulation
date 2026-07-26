@@ -185,6 +185,35 @@ every scan chunk's outcome, compare totals, each trash chunk's counts, lock cont
 the log and slow a 37K-file walk. The swap also toasts as well as alerting, since a modal
 is easy to miss and was previously the only sign the menu item had run.
 
+**v5.5** — built for the whole tree. A ~100k-file, 800 GB folder exposed two costs that grow
+with the scan rather than staying flat, which is what stops a large tree from ever finishing.
+
+- **The per-chunk file-ID preload is gone.** Every scan chunk used to read back every
+  recorded file ID to keep `_scan_files` free of repeats — a read that grows with every file
+  scanned and would come to dominate each 4.5-minute execution. Repeats are now collapsed by
+  ID in `runDeduplication`, which already reads the list exactly once, and a per-execution
+  set still covers the common case (a folder re-listed after a stale page token). This is
+  load-bearing: a file recorded twice would otherwise look like two copies of itself and be
+  offered up for trashing *against itself* — hence a harness check for exactly that, using
+  both a re-listed folder and a file reachable through two parents.
+- **The compare streams `_scan_files`** in 50k-row pages (`forEachDataRow`) instead of
+  pulling a million-plus cells into one array.
+- **Decoration is resumable.** The compare writes row values first — that is what trashing
+  reads, so the list is usable immediately — then makes the URLs clickable and adds the swap
+  boxes under the deadline. If it runs out of time it records the first undecorated row in
+  `LINKS_FROM` and the dialog finishes the job a chunk per call (`finishPendingLinks`),
+  instead of the whole compare timing out and restarting from scratch forever. Undecorated
+  rows hold plain URL text, which every code path already reads as text.
+
+Also: `lastDuplicateRow` bounds decoration by the last row with a Duplicate ID rather than
+`getLastRow()`, so a helper column filled down past the data cannot stretch the work, and
+`linkRuns` steps over blank cells because a rich text value needs actual text.
+
+**Why not scan subtrees separately?** Because duplicates that span subtrees — the same file
+in two different branches — would never be found, and that is the most common shape of
+accumulated duplication. The 800 GB is irrelevant: no file is ever downloaded, only
+metadata, so file and folder *counts* are the only thing that scales.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.

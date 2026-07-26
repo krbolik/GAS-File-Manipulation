@@ -60,6 +60,7 @@
     let scanUrl = '';
     let scanning = false;
     let trashing = false;
+    let decorating = false;
     let failures = 0;
     let busyWaits = 0;
     let wantCompare = false;
@@ -78,6 +79,8 @@
           scanUrl = st.rootUrl;
         }
         paintButtons();
+        // A compare that ran out of time left links undecorated; pick that up on open.
+        if (st.linksPending && !scanning && !trashing) finishLinks();
       }).getState();
     }
 
@@ -327,8 +330,32 @@
         html += '<br><span class="note">These duplicates can be trashed right now; click <b>Resume Scan</b> ' +
                 'whenever you want the rest of the tree. Comparing again later keeps the rows already handled.</span>';
       }
+      if (res.linksPending) {
+        html += '<br><span class="note">Still making the links clickable and adding the swap boxes — the ' +
+                'rows themselves are complete, so you can start reviewing and trashing now.</span>';
+      }
       say(html);
       refreshState();
+      if (res.linksPending) finishLinks();
+    }
+
+    /**
+     * Finishes a decoration pass the compare ran out of time for. Purely cosmetic — the row
+     * values are already written — so failures here are swallowed rather than surfaced.
+     * One chain at a time: several refreshState calls would otherwise race for the lock.
+     */
+    function finishLinks() {
+      if (decorating) return;
+      decorating = true;
+      const step = () => {
+        google.script.run.withSuccessHandler(r => {
+          if (!r || r.error) { decorating = false; return; }
+          if (r.pending) return step();
+          decorating = false;
+          refreshState();
+        }).withFailureHandler(() => { decorating = false; }).finishPendingLinks();
+      };
+      step();
     }
 
     /* ------------------------------------------------------------------ trash */

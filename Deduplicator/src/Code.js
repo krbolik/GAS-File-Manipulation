@@ -147,6 +147,9 @@ const P_PHASE = 'PHASE';
 const P_ROOT = 'ROOT_ID';
 const P_CURSOR = 'QUEUE_CURSOR';
 const P_PAGE = 'PAGE_TOKEN';
+const P_LINKS_FROM = 'LINKS_FROM';   // first Duplicates row still needing its links
+
+const READ_PAGE_ROWS = 50000;        // rows per getValues when streaming a big sheet
 
 const K_STATUS = 'STATUS';           // cache keys — cross-execution, unlike properties
 const K_PAUSE = 'PAUSE_REQUEST';
@@ -557,6 +560,21 @@ function readColumns(sh, numCols) {
   return sh.getRange(2, 1, n, numCols).getValues();
 }
 
+/**
+ * Streams a sheet's data rows to a callback in pages. _scan_files reaches hundreds of
+ * thousands of rows on a large tree; pulling that into one array is a million-plus cells
+ * held at once, so it is read in slices instead.
+ */
+function forEachDataRow(sh, numCols, fn) {
+  const n = sh.getLastRow() - 1;
+  for (let offset = 0; offset < n; offset += READ_PAGE_ROWS) {
+    const height = Math.min(READ_PAGE_ROWS, n - offset);
+    const rows = sh.getRange(2 + offset, 1, height, numCols).getValues();
+    for (let i = 0; i < rows.length; i++) fn(rows[i], offset + i);
+  }
+  return n;
+}
+
 /* ----------------------------------------------------------------- status -- */
 
 let statusState = {};
@@ -631,7 +649,7 @@ function processFolder(inputUrl) {
 
     if (Date.now() > deadline) return { timeout: true, count: statusState.files || 0, phase: 'Comparing' };
 
-    const summary = runDeduplication();
+    const summary = runDeduplication(deadline);
     props.deleteProperty(P_PHASE);
     return summary;
 
@@ -713,13 +731,22 @@ function scanUntilDeadline(deadline) {
 
   const queue = readColumns(queueSh, 2);                       // [[folderId, path], …]
   const seenFolders = new Set(queue.map(r => r[0]));
-  const seenFiles = new Set(readColumns(filesSh, 1).map(r => r[0]));
+
+  /*
+   * Every recorded file id used to be read back here to keep _scan_files free of repeats.
+   * That read grows with every file scanned — at a hundred thousand files it would eat a
+   * large slice of each chunk and keep getting worse, which is what stops a big tree from
+   * finishing. Repeats are collapsed by id in runDeduplication instead, which already
+   * reads the whole list exactly once; a per-execution set still covers the only case
+   * that happens often, a folder re-listed after a stale page token.
+   */
+  const recordedHere = new Set();
 
   let cursor = Number(props.getProperty(P_CURSOR) || 0);
   let pageToken = props.getProperty(P_PAGE) || null;
   let fileBuf = [];
   let queueBuf = [];
-  let fileCount = seenFiles.size;
+  let fileCount = Math.max(0, filesSh.getLastRow() - 1);       // records, not distinct ids
 
   const flush = () => {
     appendRows(filesSh, fileBuf);
@@ -791,8 +818,8 @@ function scanUntilDeadline(deadline) {
         queueBuf.push([f.id, childPath]);
         return;
       }
-      if (seenFiles.has(f.id)) return;
-      seenFiles.add(f.id);
+      if (recordedHere.has(f.id)) return;
+      recordedHere.add(f.id);
       fileCount++;
       setStatus({ currentFile: f.name, files: fileCount });
       // The date is stored as Drive's RFC 3339 string: it sorts correctly as plain
@@ -837,7 +864,9 @@ function isSkippableFolderError(e) {
  * handled is carried across the rewrite, so trashing work done on a partial result is
  * neither lost nor repeated when the finished scan is compared again.
  */
-function runDeduplication() {
+function runDeduplication(deadline) {
+  deadline = deadline || (Date.now() + MAX_RUNTIME);
+  const props = PropertiesService.getScriptProperties();
   const prevStatus = readStatusByFileId();          // before getSheet may re-head the sheet
   const pairChoice = readPairChoices();             // and before the rows are rewritten
   const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
@@ -856,20 +885,26 @@ function runDeduplication() {
   dupesSh.getRange(1, D_COL_SWAP).setNote(SWAP_NOTE);
   dupesSh.getRange(1, D_COL_ORIG_DATE).setNote(DATE_NOTE);
 
-  const rows = readColumns(filesSh, FILES_HEADERS.length);
   const groups = {};
   const dupeRows = [];
-  let skipped = 0, carried = 0, kept = 0, undated = 0;
+  const seenIds = new Set();
+  let skipped = 0, carried = 0, kept = 0, undated = 0, repeats = 0;
 
-  rows.forEach((r, seq) => {
-    const hash = r[4], size = r[2];
+  // The scan no longer filters repeats itself, so they are collapsed here. This must not
+  // be missed: the same file recorded twice would otherwise look like two copies of
+  // itself and be offered up for trashing against itself.
+  const fileRecords = forEachDataRow(filesSh, FILES_HEADERS.length, (r, seq) => {
+    const id = r[0], hash = r[4], size = r[2];
+    if (!id || seenIds.has(id)) { repeats++; return; }
+    seenIds.add(id);
     if (!hash || !size) { skipped++; return; }
     if (!r[5]) undated++;
     const key = hash + '_' + size;
     (groups[key] = groups[key] || []).push({
-      id: r[0], name: r[1], size: size, path: r[3], hash: hash, date: r[5] || '', seq: seq
+      id: id, name: r[1], size: size, path: r[3], hash: hash, date: r[5] || '', seq: seq
     });
   });
+  const distinctFiles = seenIds.size;
 
   Object.keys(groups).forEach(key => {
     const members = groups[key];
@@ -894,19 +929,26 @@ function runDeduplication() {
     });
   });
 
+  // Values first: they are what trashing reads, so the list is usable the moment this
+  // returns. Making the URLs clickable and adding the swap boxes is decoration, and it is
+  // the part that can run long on a big list — so it runs under the deadline and picks up
+  // where it left off if it does not finish.
   const start = appendRows(dupesSh, dupeRows);
-  linkifyColumn(dupesSh, start, D_COL_DUPE_LINK, dupeRows.map(r => r[D_COL_DUPE_LINK - 1]));
-  linkifyColumn(dupesSh, start, D_COL_ORIG_LINK, dupeRows.map(r => r[D_COL_ORIG_LINK - 1]));
-  if (start) dupesSh.getRange(start, D_COL_SWAP, dupeRows.length, 1).insertCheckboxes();
-  setStatus({ currentFile: 'Compared — ' + dupeRows.length + ' duplicates', files: rows.length }, true);
+  if (start) props.setProperty(P_LINKS_FROM, String(start));
+  const decorated = decorateRows(dupesSh, deadline);
+
+  setStatus({ currentFile: 'Compared — ' + dupeRows.length + ' duplicates', files: distinctFiles }, true);
   logIt('compare done', {
-    files: rows.length,
+    fileRecords: fileRecords,
+    distinctFiles: distinctFiles,
+    repeatRecords: repeats,
     duplicates: dupeRows.length,
     pending: dupeRows.length - carried,
     alreadyHandled: carried,
     swapsKept: kept,
     noHashOrEmpty: skipped,
-    undated: undated
+    undated: undated,
+    linksPending: !decorated
   });
 
   return {
@@ -915,11 +957,97 @@ function runDeduplication() {
     pending: dupeRows.length - carried,
     alreadyHandled: carried,
     swapsKept: kept,
-    totalFiles: rows.length,
+    totalFiles: distinctFiles,
+    repeats: repeats,
     skipped: skipped,
     undated: undated,
+    linksPending: !decorated,
     sheetUrl: dupesSheetUrl(dupesSh)
   };
+}
+
+/**
+ * Turns the URL text already sitting in the two link columns into clickable links and
+ * gives each row its swap checkbox, working forward from the row recorded in
+ * P_LINKS_FROM and saving progress as it goes.
+ *
+ * Returns true when the whole list is decorated, false when the deadline cut it short —
+ * in which case the property still points at the first undecorated row, so the next call
+ * continues from there. Nothing about trashing or swapping depends on this having run:
+ * the URLs are plain text until it does, and both are read as text either way.
+ */
+function decorateRows(dupesSh, deadline) {
+  const props = PropertiesService.getScriptProperties();
+  let row = Number(props.getProperty(P_LINKS_FROM) || 0);
+  const last = lastDuplicateRow(dupesSh);
+  if (!row || row > last) {
+    props.deleteProperty(P_LINKS_FROM);
+    return true;
+  }
+
+  while (row <= last) {
+    if (Date.now() > deadline) {
+      logIt('decoration paused', { nextRow: row, lastRow: last });
+      return false;
+    }
+    const height = Math.min(LINK_CHUNK, last - row + 1);
+    const dupeUrls = dupesSh.getRange(row, D_COL_DUPE_LINK, height, 1).getValues().map(r => r[0]);
+    const origUrls = dupesSh.getRange(row, D_COL_ORIG_LINK, height, 1).getValues().map(r => r[0]);
+    // Runs, because a rich text value needs actual text: a blank cell in the middle of the
+    // block (a row deleted by hand, say) must be stepped over, not linked.
+    linkRuns(row, dupeUrls).forEach(r => linkifyColumn(dupesSh, r.row, D_COL_DUPE_LINK, r.urls));
+    linkRuns(row, origUrls).forEach(r => linkifyColumn(dupesSh, r.row, D_COL_ORIG_LINK, r.urls));
+    dupesSh.getRange(row, D_COL_SWAP, height, 1).insertCheckboxes();
+    row += height;
+    props.setProperty(P_LINKS_FROM, String(row));
+  }
+
+  props.deleteProperty(P_LINKS_FROM);
+  logIt('decoration complete', { throughRow: last });
+  return true;
+}
+
+/**
+ * Last row that actually holds a duplicate. Not getLastRow(): a helper column someone
+ * filled down past the data would stretch that beyond the rows this decorates.
+ */
+function lastDuplicateRow(dupesSh) {
+  const n = dupesSh.getLastRow() - 1;
+  if (n < 1) return 1;
+  const ids = dupesSh.getRange(2, D_COL_DUPE_ID, n, 1).getValues();
+  for (let i = ids.length - 1; i >= 0; i--) if (ids[i][0]) return i + 2;
+  return 1;
+}
+
+/** Contiguous stretches of non-empty urls, as [{row, urls}] starting at startRow. */
+function linkRuns(startRow, urls) {
+  const runs = [];
+  let current = null;
+  urls.forEach((u, i) => {
+    if (!u) { current = null; return; }
+    if (!current) { current = { row: startRow + i, urls: [] }; runs.push(current); }
+    current.urls.push(u);
+  });
+  return runs;
+}
+
+/**
+ * Finishes a decoration pass the compare could not complete in its own execution. The
+ * dialog calls this until `pending` is false; nothing is blocked while it runs.
+ */
+function finishPendingLinks() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_WAIT)) return busyReply('Another scan or trash run');
+  try {
+    const dupesSh = getSheet(DUPES_SHEET, DUPES_HEADERS);
+    const done = decorateRows(dupesSh, Date.now() + MAX_RUNTIME);
+    return { done: done, pending: !done };
+  } catch (e) {
+    logIt('finishPendingLinks failed', describeError(e));
+    return { error: describeError(e), resumable: true };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /**
@@ -1027,10 +1155,11 @@ function compareScannedSoFar() {
     if (filesSh.getLastRow() < 2) {
       return { error: 'Nothing has been scanned yet — run "Analyze Folder" first.' };
     }
-    const summary = runDeduplication();
+    const summary = runDeduplication(Date.now() + MAX_RUNTIME);
     summary.partial = !!PropertiesService.getScriptProperties().getProperty(P_PHASE);
     return summary;
   } catch (e) {
+    logIt('compareScannedSoFar failed', describeError(e));
     return { error: describeError(e) };
   } finally {
     lock.releaseLock();
@@ -1063,6 +1192,7 @@ function getState() {
     }
     return {
       phase: props.getProperty(P_PHASE) || '',
+      linksPending: !!props.getProperty(P_LINKS_FROM),
       rootUrl: rootId ? 'https://drive.google.com/drive/folders/' + rootId : '',
       scannedFiles: filesSh ? Math.max(0, filesSh.getLastRow() - 1) : 0,
       dupeTotal: total,
