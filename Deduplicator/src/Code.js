@@ -2,7 +2,7 @@
  * Tech Angel Deduplicator v5.4 (Sheet-backed, resumable, interruptible)
  *
  * HOW TO USE:
- *   1. In the bound Google Sheet, open the "🚀 Angel" menu → "Start Deduplicator".
+ *   1. In the bound Google Sheet, open the "🚀 Angel" menu → "Start Deduplicator Dialog".
  *   2. Paste a Google Drive folder URL into the dialog and click "Analyze Folder".
  *   3. Wait for the scan (it auto-resumes if it hits the 6-min limit).
  *   4. Review the "Duplicates" sheet, then click "Move Duplicates to Trash".
@@ -176,7 +176,7 @@ const K_PAUSE = 'PAUSE_REQUEST';
 
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('🚀 Angel')
-      .addItem('Start Deduplicator', 'showUi')
+      .addItem('Start Deduplicator Dialog', 'showUi')
       .addItem('Compare Files Scanned So Far', 'compareScannedSoFarMenu')
       .addItem('Keep Duplicate Instead (selected rows)', 'swapSelectedRows')
       .addSeparator()
@@ -546,7 +546,7 @@ function compareScannedSoFarMenu() {
   if (res.error) return ui.alert(res.error);
   ui.alert(res.dupeCount + ' duplicate(s) found among ' + res.totalFiles +
            ' file(s) scanned so far' + (res.partial ? ' (scan incomplete — resume it from the dialog).' : '.') +
-           '\n\nThey are listed in the "' + DUPES_SHEET + '" sheet. Open 🚀 Angel → Start Deduplicator ' +
+           '\n\nThey are listed in the "' + DUPES_SHEET + '" sheet. Open 🚀 Angel → Start Deduplicator Dialog ' +
            'to trash them.');
 }
 

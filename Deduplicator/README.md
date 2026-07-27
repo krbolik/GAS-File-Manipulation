@@ -3,12 +3,122 @@
 Version-controlled source for the **Tech Angel Deduplicator** Google Apps Script — a
 tool that recursively scans a Google Drive folder, finds duplicate files by content
 hash, and moves them to Trash. The script is bound to the **"DuplicateFinder"** Google
-Sheet.
+Sheet ([open it](https://docs.google.com/spreadsheets/d/1DZuoYcTXyTV35llQlO3qmTK6m4NDH3h6-P6R7Jru9D0/edit)).
 
 > **[ARCHITECTURE.md](ARCHITECTURE.md)** — the design document: component model, the
 > search algorithm (hash bucketing, Θ(N) — *not* the pairwise Θ(N²) it is often assumed
 > to be), complexity and capacity tables, ranked scalability constraints with thresholds,
-> correctness invariants and the risk register. Start there for *why*; this file is *how*.
+> correctness invariants and the risk register. Read that for *why*; below is *how*.
+
+---
+
+# How to use it
+
+**The one rule to remember:** of a set of identical files, the **newest copy is kept**. Every
+older copy is listed for trashing. Trashed files stay recoverable from Drive Trash.
+
+## A whole run, start to finish
+
+| # | Do this | Where |
+|---|---|---|
+| 1 | **🚀 Angel → Start Deduplicator Dialog** | Menu |
+| 2 | Paste the Drive folder URL, click **Analyze Folder** | Dialog |
+| 3 | Optional: click **Run in the Background** — then you can close everything | Dialog |
+| 4 | Wait. It resumes itself past every time limit | — |
+| 5 | Review the **Duplicates** sheet: check the links, tick **Swap ⇄** where you want the other copy kept, delete rows you want left alone | Sheet |
+| 6 | Click **Move N Duplicates to Trash** and confirm | Dialog |
+
+Trashing is always the last step and always manual.
+
+## The dialog
+
+| Control | What it does |
+|---|---|
+| **Analyze Folder** | Starts a new scan of the pasted URL. Clears any previous scan and duplicate list |
+| **Resume Scan** | Continues the paused scan exactly where it stopped. Shown instead of *Analyze Folder* whenever a scan is unfinished |
+| **Pause & Compare What Is Scanned So Far** | Stops the walk at the next folder and lists the duplicates found up to that point, so you can trash them without waiting for the rest |
+| **Compare N Scanned Files Now** | Same thing when no scan is running: rebuilds the duplicate list from everything scanned so far |
+| **Run in the Background (computer can be off)** | Hands the scan to Google's servers. Continues every 5 minutes with the tab closed and the machine off. Max 5 hours per day. **Never trashes** |
+| **Stop Background Scan** | Cancels that, so you can drive it by hand again |
+| **Move N Duplicates to Trash** | Trashes every row with an empty **Status**. Greyed out while a scan is running — pause it first |
+| Status area | Live progress: parent folder, current folder, current file, and `folder N/M` |
+
+## In the sheet ("Duplicates" tab)
+
+| Column | What it is |
+|---|---|
+| A–D | The **duplicate**: name, clickable link, path, date — this is the copy that gets trashed |
+| E–H | The **original**: name, clickable link, path, date — this is the copy that survives |
+| I `Size` | Bytes. Sortable |
+| J `Copies` | How many identical copies exist, counting the one being kept. `2` = a simple pair, `5` = a family of five |
+| K–L | `Duplicate ID` and `Hash` — for the script. `Hash` is the family marker: identical files share it |
+| M `Status` | Empty = will be trashed. `Trashed` = done. `Error: …` = it tried and failed |
+| N `Swap ⇄` | **Tick to keep this row's duplicate instead** — the two sides trade places, so the file shown as *Original* gets trashed. The box clears itself; tick again to undo |
+
+**Safe to do any time nothing is running:** sort, filter, delete rows, tick Swap. Nothing
+depends on row order.
+
+**Careful with these three:**
+
+- **Trashing ignores filters.** Every row with an empty Status is trashed, including rows a
+  filter is hiding. To exclude rows, delete them.
+- **Deleting a row only lasts for this run.** The next compare rebuilds it from the scan data.
+  To make a keep-decision stick, use **Swap ⇄**.
+- **In a family of 3+, swap only one row** — the row holding the copy you want to keep. Swapping
+  every row of a family means nothing gets removed from it.
+
+## The menu (🚀 Angel)
+
+| Item | What it does |
+|---|---|
+| **Start Deduplicator Dialog** | Opens the dialog |
+| **Compare Files Scanned So Far** | Same as *Pause & Compare*, but works with the dialog closed |
+| **Keep Duplicate Instead (selected rows)** | Swaps every selected row at once. Skips rows a filter is hiding |
+| **Run Scan in the Background** | Same as the dialog button |
+| **Stop Background Scan** | Same as the dialog button |
+| **Reset Scan Progress** | ⚠️ Throws the scan and the whole duplicate list away. Only for starting on a different folder |
+
+## Is it finished, or did it stop?
+
+Open the dialog and look at the top button:
+
+| You see | It means |
+|---|---|
+| **Analyze Folder** + background off | **Finished** — scan and comparison are complete. Review and trash |
+| **Resume Scan** + *"Running on Google's servers … 45 of 300 min used today"* | Still working. Close the tab and leave it |
+| **Resume Scan** + *"… 300 of 300 min used today"* | Paused on today's 5-hour limit. Resumes by itself after midnight |
+| **Resume Scan** + background off | Stopped. Click **Resume Scan**, or turn background mode back on |
+
+The status area also tells you: if it names a real folder and file, a chunk ran within the last
+ten minutes. For a full history open **Extensions → Apps Script → Executions** and look for
+lines starting with `Dedup`.
+
+## If something goes wrong
+
+Nothing is ever lost. Every file's outcome is written to the sheet as it happens, and the scan's
+position is saved continuously.
+
+| Situation | What to do |
+|---|---|
+| Dialog closed, tab crashed, laptop slept | Reopen the dialog → **Resume Scan** (or the trash button, if it was trashing) |
+| *"Waiting… another run is still finishing"* | Nothing. It retries by itself |
+| *"Trashing stopped"* or *"Scan stopped"* | Click the same button again — it continues, never repeats |
+| Some rows show `Error: …` | Those files could not be trashed (usually not yours to delete). Everything else went fine |
+| You swapped rows by mistake | Nothing has been trashed yet. Rows where the **Duplicate Date** is *newer* than the **Original Date** are the swapped ones; select them and use **Keep Duplicate Instead** to flip them back |
+
+**Never press Reset Scan Progress** unless you truly want to start over — it is the one action
+that cannot be undone, and it also deletes the record of what was already trashed.
+
+> **Why some duplicates never appear:** Google Docs/Sheets/Slides have no content hash, and
+> empty files match everything, so neither is ever reported. Shortcuts are ignored. The dialog
+> tells you how many files were skipped for these reasons.
+
+---
+
+# Developer reference
+
+Everything below is for working *on* the script rather than *with* it: version history first,
+then how it works internally, then the clasp/git workflow.
 
 ## Status — v5.0
 
@@ -262,38 +372,6 @@ show `Error: …` and can be retried by the owner). See
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
 
-## How to use
-
-1. Open the bound Google Sheet
-   ([DuplicateFinder](https://docs.google.com/spreadsheets/d/1DZuoYcTXyTV35llQlO3qmTK6m4NDH3h6-P6R7Jru9D0/edit)).
-2. In the menu bar, click **🚀 Angel → Start Deduplicator**. A dialog opens.
-3. Paste a **Google Drive folder URL** (e.g. `https://drive.google.com/drive/folders/<id>`)
-   and click **Analyze Folder**.
-4. Watch the live status (parent folder / current folder / active file). If the scan hits
-   the Apps Script 6-minute limit it **pauses and auto-resumes** until the whole tree is
-   covered — no action needed.
-5. When the scan finishes, the full duplicate list is written to the **Duplicates** sheet.
-   Review it there — **delete any row you want left alone**, and tick **Swap ⇄** on a row to
-   keep *that* copy and trash the original instead — then click **Move Duplicates to Trash**
-   in the dialog and confirm.
-6. **Don't want to wait for the whole tree?** Click **Pause & Compare What Is Scanned So Far**
-   at any time. The walk stops at the next folder, the files seen so far are compared, and the
-   duplicates among them can be trashed right away. **Resume Scan** continues where it stopped;
-   comparing again later keeps the rows you already trashed marked as handled.
-7. **Don't want to keep the computer on?** **🚀 Angel → Run Scan in the Background** (or the
-   button in the dialog) hands the scan to a server-side trigger: it continues every 5 minutes
-   with the tab closed and the machine off, up to 5 hours of runtime per day, and stops itself
-   when the scan and comparison are finished. It **never trashes** — that stays a manual step.
-8. If the dialog was closed or its connection died, just reopen it — it reads the current state
-   back and offers **Resume Scan** plus the trash button for any unhandled rows. The same
-   compare is available without the dialog via **🚀 Angel → Compare Files Scanned So Far**.
-9. To discard a paused or stale scan and start clean: **🚀 Angel → Reset Scan Progress**.
-
-> **The newest copy is the one that survives.** For each set of byte-identical files the
-> most recently modified copy is kept as the original and every older copy is trashed —
-> both dates are in the sheet, and **Swap ⇄** overrules the choice per row. Trashed files
-> stay recoverable from Drive Trash.
-
 ## How it works (complete flow)
 
 | Stage | Function(s) | What happens |
@@ -333,11 +411,14 @@ two cross-execution signals — the live status (`STATUS`) and the pause request
 
 ## Known limits
 
-- **Google-native files** (Docs/Sheets/Slides) have no `md5Checksum` and are recorded but
-  **never reported as duplicates** — comparing them would mean exporting each to PDF and
-  hashing that, which is slow and unsafe. The dialog reports how many were skipped.
-- **Zero-byte files** are likewise excluded (every empty file matches every other one).
-- **Shortcuts** are ignored; a file reachable through several parents is counted once.
+Why the exclusions above exist, in technical terms:
+
+- **Google-native files** (Docs/Sheets/Slides) have no `md5Checksum`, so comparing them would
+  mean exporting each to PDF and hashing that — slow and unsafe. They are recorded in
+  `_scan_files` but never grouped.
+- **Zero-byte files** are excluded because every empty file matches every other one.
+- **Shortcuts** are skipped; a file reachable through several parents is recorded more than
+  once and collapsed by ID at compare time.
 - Paths are relative to the scanned root, not to My Drive.
 
 ## Repository layout
