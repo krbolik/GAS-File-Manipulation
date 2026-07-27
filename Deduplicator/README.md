@@ -36,10 +36,14 @@ Trashing is always the last step and always manual.
 |---|---|
 | **Analyze Folder** | Starts a new scan of the pasted URL. Clears any previous scan and duplicate list |
 | **Resume Scan** | Continues the paused scan exactly where it stopped. Shown instead of *Analyze Folder* whenever a scan is unfinished |
+| **Pause Scanning** | What the top button becomes while a scan is running. Stops at the next folder — a few seconds — without comparing. Closing the dialog still works too |
+| **Pause Trashing** | What the trash button becomes while trashing. The batch in flight finishes (up to a few minutes), then it stops. Click the trash button again to continue |
 | **Pause & Compare What Is Scanned So Far** | Stops the walk at the next folder and lists the duplicates found up to that point, so you can trash them without waiting for the rest |
 | **Compare N Scanned Files Now** | Same thing when no scan is running: rebuilds the duplicate list from everything scanned so far |
 | **Run in the Background (computer can be off)** | Hands the scan to Google's servers. Continues every 5 minutes with the tab closed and the machine off. Max 5 hours per day. **Never trashes** |
 | **Stop Background Scan** | Cancels that, so you can drive it by hand again |
+| **Trash N in the Background (computer can be off)** | Works through the Duplicates sheet unattended, same 5 h/day budget. Asks for confirmation every time it is switched on, and stops itself when every row has a Status. Only one background job runs at a time |
+| **Stop Background Trashing** | Cancels it. Rows already handled keep their Status |
 | **Move N Duplicates to Trash** | Trashes every row with an empty **Status**. Greyed out while a scan is running — pause it first |
 | Status area | Live progress: parent folder, current folder, current file, and `folder N/M` |
 
@@ -57,6 +61,20 @@ Trashing is always the last step and always manual.
 
 **Safe to do any time nothing is running:** sort, filter, delete rows, tick Swap. Nothing
 depends on row order.
+
+**What trashing can and cannot touch** — the same rules whether you run it from the dialog or
+in the background:
+
+- **Only rows that are in the sheet.** A row you delete is gone from the list and is never
+  trashed. Nothing outside the sheet is ever touched, and the list is re-read from the sheet
+  on every batch — it is never cached, so deleting a row takes effect immediately.
+- **Only rows with an empty Status**, so nothing is trashed twice.
+- **Only rows that carry a hash and a well-formed file ID** — i.e. rows this tool wrote. A
+  hand-typed or pasted row is refused with `Error:` rather than acted on.
+- **Never a duplicate whose original is already in the trash.** Those rows get
+  `Skipped: the original is already in the trash`, because trashing them could leave a set of
+  identical files with no live copy at all. Tick **Swap ⇄** on such a row to flip the sides and
+  it becomes eligible again.
 
 **Careful with these three:**
 
@@ -76,6 +94,8 @@ depends on row order.
 | **Keep Duplicate Instead (selected rows)** | Swaps every selected row at once. Skips rows a filter is hiding |
 | **Run Scan in the Background** | Same as the dialog button |
 | **Stop Background Scan** | Same as the dialog button |
+| **Trash Duplicates in the Background** | Same as the dialog button, with a yes/no on the exact row count |
+| **Stop Background Trashing** | Same as the dialog button |
 | **Reset Scan Progress** | ⚠️ Throws the scan and the whole duplicate list away. Only for starting on a different folder |
 
 ## Is it finished, or did it stop?
@@ -368,6 +388,32 @@ whoever installed them, and `setTrashed` can fail on files that account doesn't 
 show `Error: …` and can be retried by the owner). See
 [ARCHITECTURE.md §4](ARCHITECTURE.md) for the full scheduler model.
 
+**v5.8** — unattended trashing, a visible pause, and a ledger that matches Google's clock.
+
+- **The daily budget now rolls at midnight US Pacific** (`QUOTA_TZ`), not midnight Berlin.
+  Apps Script's own quotas reset at midnight Pacific, so a ledger rolling nine hours earlier
+  handed out a fresh 5 h while Google still considered the day spent — and those ticks ran
+  straight into a quota error.
+- **Pause is a button, not a trick.** While a scan is looping the top button becomes **Pause
+  Scanning** (stops at the next folder, no compare); while trashing, the red button becomes
+  **Pause Trashing** (the batch in flight finishes, then it stops). Closing the dialog still
+  works and remains the safety net.
+- **Background trashing** (`backgroundTrashTick`), for lists too long to sit through — 72,000
+  rows is ~7 h of runtime. It shares the *same* 5 h/day ledger as background scanning, so
+  whichever runs first spends it, and the two are **mutually exclusive**: one background job
+  at a time, since they contend for the same lock. It requires an explicit confirmation every
+  time it is enabled, and removes its own trigger when no row is left pending.
+- **Hard guards on what may be trashed**, in `trashOneRow`, applying to both the dialog and the
+  background runner: the row must be present in the sheet (re-read every batch — never cached,
+  so deleting a row is final), have an empty Status, carry a hash and a well-formed file ID,
+  and — new — **its original must still be alive**. A duplicate whose keeper is already in the
+  trash is `Skipped:`, not trashed, because trashing it could leave a set of identical files
+  with no live copy. That costs one Drive read per family, cached per execution, and is
+  switchable via `VERIFY_KEEPER`.
+- The background trash runner also **refuses to run on an older sheet layout** rather than
+  letting `getSheet` migrate it, since migration clears rows — and it never compares, so
+  deleted rows are never silently regenerated and then trashed.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -481,3 +527,5 @@ Because it is bound, the `onOpen` **🚀 Angel** menu appears automatically in t
 spreadsheet, and `SpreadsheetApp.getUi()` works. To open the code from the sheet:
 **Extensions → Apps Script**. `clasp pull` / `clasp push` sync this repo with that same
 bound project (scriptId `1U_Ej4u1kFRmR3ywpdnCHmbjImRxuNzZmIu5DRHMw6SpKpHFKzrH-k2lb`).
+
+Todo:

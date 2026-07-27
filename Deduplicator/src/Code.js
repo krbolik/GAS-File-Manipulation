@@ -96,6 +96,13 @@ const FLUSH_EVERY = 200;             // rows buffered before a batched sheet wri
 const STATUS_EVERY = 2000;           // ms between live-status writes
 const PAGE_SIZE = 1000;              // Drive list page size
 const TRASH_FLUSH = 50;              // Status cells written per batch while trashing
+
+/**
+ * Check the original is still alive before trashing its duplicate — one extra Drive read
+ * per family (cached per execution), buying the guarantee that no family is ever left with
+ * every copy in the trash. Switchable because it is the only meaningful cost in the loop.
+ */
+const VERIFY_KEEPER = true;
 const RETRY_TRIES = 4;               // attempts per Drive/Sheets call before giving up
 const LOCK_WAIT = 20 * 1000;         // how long to wait for a busy predecessor to finish
 
@@ -158,8 +165,17 @@ const P_BG_DAY = 'BG_DAY';           // yyyy-MM-dd the background budget below b
 const P_BG_USED = 'BG_USED_MS';      // background runtime already spent on that day
 
 const BG_TRIGGER_FN = 'backgroundScanTick';
+const BG_TRASH_FN = 'backgroundTrashTick';
 const BG_EVERY_MINUTES = 5;          // trigger cadence; a chunk is 4.5 min, so no overlap
 const BG_MIN_SLICE_MS = 30 * 1000;   // below this, a tick is not worth its own overhead
+
+/**
+ * Timezone whose midnight rolls the daily budget. Deliberately *not* the script's own
+ * timezone: Apps Script's daily quotas reset at midnight US Pacific, so a ledger that
+ * rolled at midnight Berlin would hand out a fresh 5 h nine hours before Google does —
+ * and those ticks would run straight into a quota that had not reset yet.
+ */
+const QUOTA_TZ = 'America/Los_Angeles';
 
 /**
  * Self-imposed daily ceiling on *background* runtime, deliberately below the platform's
@@ -182,6 +198,8 @@ function onOpen() {
       .addSeparator()
       .addItem('Run Scan in the Background', 'startBackgroundScanMenu')
       .addItem('Stop Background Scan', 'stopBackgroundScanMenu')
+      .addItem('Trash Duplicates in the Background', 'startBackgroundTrashMenu')
+      .addItem('Stop Background Trashing', 'stopBackgroundTrashMenu')
       .addSeparator()
       .addItem('Reset Scan Progress', 'resetToken')
       .addToUi();
@@ -208,6 +226,44 @@ function stopBackgroundScanMenu() {
       : 'Background scanning is OFF. Use the dialog to continue by hand.');
 }
 
+/**
+ * Trashing unattended is the one irreversible thing this tool can do without a human
+ * present, so the menu asks for a yes/no on the exact number of rows first.
+ */
+function startBackgroundTrashMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const check = pendingTrashCount();
+  if (check.error) return ui.alert(check.error);
+  if (!check.pending) return ui.alert('Nothing to trash — every row already has a Status.');
+
+  const answer = ui.alert(
+      'Trash ' + check.pending + ' files in the background?',
+      'Every row of the "' + DUPES_SHEET + '" sheet whose Status is empty will be moved to ' +
+      'Drive Trash, a few hundred at a time, with no browser open — including rows you cannot ' +
+      'currently see because of a filter.\n\n' +
+      'Rows you deleted from the sheet are NOT touched, and nothing outside this sheet is ' +
+      'touched. A duplicate whose original is already in the trash is skipped rather than ' +
+      'trashed.\n\n' +
+      'It uses the same ' + Math.round(BG_DAILY_BUDGET_MS / 60000) + ' min/day budget as ' +
+      'background scanning (' + Math.round(bgBudget().leftMs / 60000) + ' min left today) and ' +
+      'stops by itself when the list is done.\n\n' +
+      'Trashed files stay recoverable from Drive Trash for 30 days.',
+      ui.ButtonSet.YES_NO);
+  if (answer !== ui.Button.YES) return ui.alert('Nothing was changed.');
+
+  const res = setBackgroundTrash(true, true);
+  ui.alert(res.error ? res.error
+      : 'Background trashing is ON — ' + check.pending + ' rows queued. You can close ' +
+        'everything. Stop it any time with 🚀 Angel → Stop Background Trashing.');
+}
+
+function stopBackgroundTrashMenu() {
+  const res = setBackgroundTrash(false);
+  SpreadsheetApp.getUi().alert(res.trashRunning
+      ? 'Background trashing is still on — the trigger could not be removed. Try again.'
+      : 'Background trashing is OFF. Rows already trashed keep their Status.');
+}
+
 /* --------------------------------------------------- background scan runner -- */
 
 /**
@@ -226,14 +282,18 @@ function stopBackgroundScanMenu() {
 function setBackgroundScan(on) {
   const props = PropertiesService.getScriptProperties();
   if (!on) {
-    const removed = removeBackgroundTriggers();
+    const removed = removeTriggers(BG_TRIGGER_FN);
     logIt('background scan stopped', { triggersRemoved: removed });
     return backgroundInfo();
   }
   if (!props.getProperty(P_PHASE) && !props.getProperty(P_LINKS_FROM)) {
     return { error: 'Nothing to run in the background — start or resume a scan first.' };
   }
-  removeBackgroundTriggers();                    // never stack duplicates
+  if (triggerExists(BG_TRASH_FN)) {
+    return { error: 'Background trashing is running. Stop that first — one background job ' +
+                    'at a time, since they share the same daily budget and the same lock.' };
+  }
+  removeTriggers(BG_TRIGGER_FN);                 // never stack duplicates
   ScriptApp.newTrigger(BG_TRIGGER_FN).timeBased().everyMinutes(BG_EVERY_MINUTES).create();
   clearPause();                                  // a stale pause would stop it immediately
   logIt('background scan started', {
@@ -241,6 +301,119 @@ function setBackgroundScan(on) {
     dailyBudgetMin: Math.round(BG_DAILY_BUDGET_MS / 60000)
   });
   return backgroundInfo();
+}
+
+/* ------------------------------------------------ background trash runner -- */
+
+/**
+ * Unattended trashing. Deliberately a separate switch from background scanning, with its
+ * own confirmation, because this is the one irreversible stage: it is only safe once the
+ * Duplicates sheet has actually been reviewed.
+ *
+ * `confirmed` must be true — an explicit opt-in, required again every time it is enabled,
+ * since the trigger removes itself when the list runs out.
+ *
+ * What it will and will not touch is the whole point:
+ *   - Only rows **present in the Duplicates sheet**, re-read from the sheet on every tick.
+ *     Rows deleted by the reviewer are simply not there, so they are never trashed. No list
+ *     is ever cached in properties, precisely so that deleting a row is final.
+ *   - Only rows whose Status is empty, so nothing is trashed twice.
+ *   - It never compares, so deleted rows are never regenerated behind the reviewer's back.
+ *   - It refuses to run at all if the sheet's header row does not match the expected layout,
+ *     rather than migrating (which would clear the rows).
+ */
+function setBackgroundTrash(on, confirmed) {
+  if (!on) {
+    const removed = removeTriggers(BG_TRASH_FN);
+    logIt('background trash stopped', { triggersRemoved: removed });
+    return backgroundInfo();
+  }
+  if (confirmed !== true) {
+    return { error: 'Background trashing needs an explicit confirmation.' };
+  }
+  if (triggerExists(BG_TRIGGER_FN)) {
+    return { error: 'Background scanning is running. Stop that first — one background job ' +
+                    'at a time, since they share the same daily budget and the same lock.' };
+  }
+
+  const check = pendingTrashCount();
+  if (check.error) return check;
+  if (!check.pending) {
+    return { error: 'Nothing to trash: no rows with an empty Status in the "' + DUPES_SHEET + '" sheet.' };
+  }
+
+  removeTriggers(BG_TRASH_FN);
+  ScriptApp.newTrigger(BG_TRASH_FN).timeBased().everyMinutes(BG_EVERY_MINUTES).create();
+  logIt('background trash started', {
+    pendingRows: check.pending,
+    everyMinutes: BG_EVERY_MINUTES,
+    budgetLeftMin: Math.round(bgBudget().leftMs / 60000)
+  });
+  return backgroundInfo();
+}
+
+/** One slice of unattended trashing. Installed as a trigger by setBackgroundTrash. */
+function backgroundTrashTick() {
+  const started = Date.now();
+  try {
+    const budget = bgBudget();
+    if (budget.leftMs < BG_MIN_SLICE_MS) {
+      logIt('background trash skipped', {
+        reason: 'daily budget spent',
+        usedMin: Math.round(budget.usedMs / 60000),
+        day: budget.day
+      });
+      return;                                    // trigger stays; resumes after the reset
+    }
+    if (pauseRequested()) {
+      logIt('background trash stopping', 'a pause was requested from the sheet');
+      removeTriggers(BG_TRASH_FN);
+      return;
+    }
+
+    // Guard the destructive path: a header mismatch means trashDuplicates' getSheet call
+    // would migrate the layout and clear every row. Stop instead.
+    const dupesSh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DUPES_SHEET);
+    if (!dupesSh || !headersMatch(dupesSh, DUPES_HEADERS)) {
+      logIt('background trash stopping', 'Duplicates sheet is missing or on an older layout');
+      removeTriggers(BG_TRASH_FN);
+      return;
+    }
+
+    const res = trashDuplicates(budget.leftMs);
+    logIt('background trash tick', {
+      trashed: res.trashed || 0,
+      errors: res.errors || 0,
+      skipped: res.skipped || 0,
+      remaining: res.remaining === undefined ? '?' : res.remaining,
+      busy: !!res.busy,
+      error: res.error || ''
+    });
+
+    if (!res.busy && !res.error && !res.remaining) {
+      removeTriggers(BG_TRASH_FN);
+      setStatus({ currentFile: 'Background trashing finished' }, true);
+      logIt('background trash complete', 'trigger removed');
+    }
+  } catch (e) {
+    logIt('background trash tick failed', describeError(e));   // trigger survives, retries
+  } finally {
+    bgSpend(Date.now() - started);
+  }
+}
+
+/** Rows still awaiting trashing, or an error explaining why the sheet cannot be used. */
+function pendingTrashCount() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DUPES_SHEET);
+  if (!sh) return { error: 'There is no "' + DUPES_SHEET + '" sheet yet — run a comparison first.' };
+  if (!headersMatch(sh, DUPES_HEADERS)) {
+    return { error: 'The "' + DUPES_SHEET + '" sheet is on an older layout. Run a comparison ' +
+                    'first so it is rebuilt, then enable background trashing.' };
+  }
+  const n = sh.getLastRow() - 1;
+  if (n < 1) return { pending: 0 };
+  const status = sh.getRange(2, D_COL_STATUS, n, 1).getValues();
+  return { pending: status.filter(r => !r[0]).length };
 }
 
 /** One slice of background work. Installed as a time-driven trigger; see setBackgroundScan. */
@@ -263,7 +436,7 @@ function backgroundScanTick() {
     // A human asked the scan to stop — honour that instead of clearing the flag and racing.
     if (pauseRequested()) {
       logIt('background scan stopping', 'a pause was requested from the sheet');
-      removeBackgroundTriggers();
+      removeTriggers(BG_TRIGGER_FN);
       return;
     }
 
@@ -288,7 +461,7 @@ function backgroundScanTick() {
       error: res.error || ''
     });
 
-    if (res.paused) { removeBackgroundTriggers(); return; }
+    if (res.paused) { removeTriggers(BG_TRIGGER_FN); return; }
     if (res.done && !res.linksPending) finishBackgroundScan();
 
   } catch (e) {
@@ -299,28 +472,44 @@ function backgroundScanTick() {
 }
 
 function finishBackgroundScan() {
-  removeBackgroundTriggers();
+  removeTriggers(BG_TRIGGER_FN);
   setStatus({ currentFile: 'Background scan finished — review the Duplicates sheet' }, true);
   logIt('background scan complete', 'trigger removed');
 }
 
-function removeBackgroundTriggers() {
+/**
+ * Removes this project's triggers for one handler. Note the scope: getProjectTriggers only
+ * returns triggers belonging to the account calling it, so one user cannot stop another
+ * user's background job — each has to stop their own.
+ */
+function removeTriggers(fn) {
   let removed = 0;
   ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === BG_TRIGGER_FN) { ScriptApp.deleteTrigger(t); removed++; }
+    if (t.getHandlerFunction() === fn) { ScriptApp.deleteTrigger(t); removed++; }
   });
   return removed;
 }
 
+function triggerExists(fn) {
+  try {
+    return ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === fn);
+  } catch (e) {
+    return false;
+  }
+}
+
 /**
- * Background runtime spent today, resetting when the date rolls over in the script's own
- * timezone. Accounting is wall-clock per tick, which is what the platform's own runtime
- * quota measures. It counts *this* runner only — the owner's other scripts draw on the
- * same daily pool, which is exactly why the budget is set below the platform ceiling.
+ * Background runtime spent today, where "today" rolls at midnight in QUOTA_TZ so the ledger
+ * lines up with Google's own daily reset. Accounting is wall-clock per tick, which is what
+ * the platform's runtime quota measures. Scanning and trashing share one budget: whichever
+ * runs first spends it.
+ *
+ * It counts *this* runner only — the owner's other scripts draw on the same daily pool,
+ * which is exactly why the budget sits below the platform ceiling.
  */
 function bgBudget() {
   const props = PropertiesService.getScriptProperties();
-  const day = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const day = Utilities.formatDate(new Date(), QUOTA_TZ, 'yyyy-MM-dd');
   let used = Number(props.getProperty(P_BG_USED) || 0);
   if (props.getProperty(P_BG_DAY) !== day) {
     used = 0;
@@ -344,12 +533,9 @@ function bgSpend(ms) {
 
 function backgroundInfo() {
   const b = bgBudget();
-  let running = false;
-  try {
-    running = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === BG_TRIGGER_FN);
-  } catch (ignored) {}
   return {
-    running: running,
+    running: triggerExists(BG_TRIGGER_FN),       // scanning
+    trashRunning: triggerExists(BG_TRASH_FN),
     usedMin: Math.round(b.usedMs / 60000),
     budgetMin: Math.round(b.budgetMs / 60000),
     leftMin: Math.round(b.leftMs / 60000),
@@ -1435,7 +1621,7 @@ function getState() {
  * files trashed since the last flush (they simply get retried, which is harmless —
  * trashing an already-trashed file succeeds).
  */
-function trashDuplicates() {
+function trashDuplicates(maxMs) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(LOCK_WAIT)) {
     logIt('trash busy', 'could not get the lock in ' + (LOCK_WAIT / 1000) + 's');
@@ -1444,7 +1630,7 @@ function trashDuplicates() {
 
   const sh = getSheet(DUPES_SHEET, DUPES_HEADERS);
   let rows = [];
-  let trashed = 0, errors = 0, remaining = 0;
+  let trashed = 0, errors = 0, skipped = 0, remaining = 0;
   let buf = [], bufStart = 0;
 
   const flushStatus = () => {
@@ -1463,8 +1649,9 @@ function trashDuplicates() {
   };
 
   try {
-    const deadline = Date.now() + MAX_RUNTIME;
+    const deadline = Date.now() + Math.min(MAX_RUNTIME, Number(maxMs) || MAX_RUNTIME);
     rows = readColumns(sh, D_COL_DATA_WIDTH);      // the swap checkbox is not needed here
+    const keeperCache = {};                        // origId → alive?, one Drive call per family
 
     for (let i = 0; i < rows.length; i++) {
       const done = rows[i][D_COL_STATUS - 1];
@@ -1474,21 +1661,11 @@ function trashDuplicates() {
       }
       if (Date.now() > deadline) { remaining = countPending(i); break; }
 
-      const id = rows[i][D_COL_DUPE_ID - 1];
-      let status;
-      if (!id) {
-        status = 'Error: no file ID in this row';
-        errors++;
-      } else {
-        try {
-          withRetry(() => DriveApp.getFileById(id).setTrashed(true));
-          status = 'Trashed';
-          trashed++;
-        } catch (e) {
-          status = 'Error: ' + describeError(e);
-          errors++;
-        }
-      }
+      const status = trashOneRow(rows[i], keeperCache);
+      if (status === 'Trashed') trashed++;
+      else if (status.indexOf('Skipped') === 0) skipped++;
+      else errors++;
+
       if (!buf.length) bufStart = i + 2;
       buf.push(status);
       if (buf.length >= TRASH_FLUSH) flushStatus();
@@ -1498,8 +1675,11 @@ function trashDuplicates() {
     flushStatus();
     setStatus({ currentFile: 'Trashed ' + trashed + ' file(s)' +
                              (remaining ? ' — ' + remaining + ' to go' : '') }, true);
-    logIt('trash chunk done', { rowsOnSheet: rows.length, trashed: trashed, errors: errors, remaining: remaining });
-    return { trashed: trashed, errors: errors, remaining: remaining };
+    logIt('trash chunk done', {
+      rowsOnSheet: rows.length, trashed: trashed, errors: errors,
+      skipped: skipped, remaining: remaining
+    });
+    return { trashed: trashed, errors: errors, skipped: skipped, remaining: remaining };
   } catch (e) {
     // Record what did get trashed before surfacing the failure, and let the client retry.
     try { flushStatus(); } catch (ignored) {}
@@ -1507,5 +1687,67 @@ function trashDuplicates() {
     return { error: describeError(e), trashed: trashed, errors: errors, resumable: true };
   } finally {
     lock.releaseLock();
+  }
+}
+
+/**
+ * Trashes exactly one row's duplicate, or explains in its returned Status why it did not.
+ * Every check here exists to make the answer to "what can this delete?" precisely *the
+ * duplicate named on a row of the Duplicates sheet*, and nothing else:
+ *
+ *   1. The row must carry a **well-formed file id**. Anything with a space, a dot or other
+ *      punctuation is not an id — it is text that ended up in the wrong column.
+ *   2. The row must carry a **hash**. Every row this tool writes has one, so a row without
+ *      one was typed or pasted by hand and is not trustworthy as an instruction to delete.
+ *   3. The row must name an **original**, and that original must still be **alive**. This is
+ *      the guard against the worst outcome available: if the keeper is already in the trash
+ *      (a swap decision lost to a rebuilt sheet, say), trashing the duplicate too would
+ *      leave a family with no live copy at all. One Drive call per family, cached.
+ *
+ * A row that fails 1 or 2 is an `Error:`; a row that fails 3 is a `Skipped:` — not the same
+ * thing, because skipping is a decision rather than a failure, and it is recoverable: tick
+ * Swap ⇄ on that row and the sides trade places, clearing the Status so it is tried again.
+ */
+function trashOneRow(row, keeperCache) {
+  const id = row[D_COL_DUPE_ID - 1];
+  const hash = row[D_COL_HASH - 1];
+  const origUrl = row[D_COL_ORIG_LINK - 1];
+
+  if (!looksLikeFileId(id)) return 'Error: no usable file ID in this row';
+  if (!hash) return 'Error: row has no hash — not written by this tool';
+
+  const origId = parseFileIdFromUrl(origUrl);
+  if (!origId) return 'Error: no original recorded for this row';
+
+  if (VERIFY_KEEPER) {
+    if (keeperCache[origId] === undefined) keeperCache[origId] = isFileAlive(origId);
+    if (keeperCache[origId] === false) return 'Skipped: the original is already in the trash';
+  }
+
+  try {
+    withRetry(() => DriveApp.getFileById(id).setTrashed(true));
+    return 'Trashed';
+  } catch (e) {
+    return 'Error: ' + describeError(e);
+  }
+}
+
+/** Drive ids are URL-safe: letters, digits, dash, underscore. Nothing else qualifies. */
+function looksLikeFileId(id) {
+  return /^[A-Za-z0-9_-]{3,}$/.test(String(id || ''));
+}
+
+/**
+ * True when the file exists and is not in the trash. A file that cannot be read at all is
+ * reported as not alive, so an unverifiable keeper stops its duplicates from being trashed
+ * rather than waving them through.
+ */
+function isFileAlive(id) {
+  try {
+    const f = withRetry(() => Drive.Files.get(id, { fields: 'id,trashed', supportsAllDrives: true }));
+    return !!f && f.trashed !== true;
+  } catch (e) {
+    logIt('keeper check failed', { id: id, error: describeError(e) });
+    return false;
   }
 }

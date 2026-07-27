@@ -23,9 +23,10 @@
 <body>
   <div class="card">
     <input type="text" id="url" placeholder="Paste Google Drive URL here...">
-    <button id="mainBtn" class="btn" onclick="startScan()">Analyze Folder</button>
+    <button id="mainBtn" class="btn" onclick="mainAction()">Analyze Folder</button>
     <button id="cmpBtn" class="btn secondary" style="display:none" onclick="compareNow()"></button>
     <button id="bgBtn" class="btn secondary" style="display:none" onclick="toggleBackground()"></button>
+    <button id="bgTrashBtn" class="btn secondary" style="display:none" onclick="toggleBackgroundTrash()"></button>
     <div id="bgNote" class="note" style="margin-top:6px"></div>
 
     <div class="status-area" id="statusArea">
@@ -39,7 +40,7 @@
     </div>
 
     <div id="results"></div>
-    <button id="delBtn" class="btn danger" style="display:none" onclick="confirmDelete()">Move Duplicates to Trash</button>
+    <button id="delBtn" class="btn danger" style="display:none" onclick="trashAction()">Move Duplicates to Trash</button>
   </div>
 
   <script>
@@ -63,6 +64,7 @@
     let scanning = false;
     let trashing = false;
     let decorating = false;
+    let stopping = false;          // the reviewer pressed Pause; finish the chunk, then stop
     let failures = 0;
     let busyWaits = 0;
     let wantCompare = false;
@@ -91,9 +93,15 @@
       const cmp = document.getElementById('cmpBtn');
       const del = document.getElementById('delBtn');
 
-      // Everything shares one script lock, so only one job may be started at a time.
-      main.disabled = scanning || trashing;
-      main.innerText = state.phase ? 'Resume Scan' : 'Analyze Folder';
+      // While a scan is looping, the main button becomes the way to stop it. Closing the
+      // dialog still works as the safety net, but a visible Pause is the honest control.
+      if (scanning) {
+        main.disabled = stopping;
+        main.innerText = stopping ? 'Pausing…' : 'Pause Scanning';
+      } else {
+        main.disabled = trashing;
+        main.innerText = state.phase ? 'Resume Scan' : 'Analyze Folder';
+      }
 
       if (scanning) {
         cmp.style.display = 'block';
@@ -111,13 +119,16 @@
 
       if (state.dupePending) {
         del.style.display = 'block';
-        // Trashing needs the script lock, which a running scan holds — pause it first.
-        del.disabled = scanning || trashing;
-        del.title = scanning ? 'Pause the scan first' : '';
-        del.innerText = trashing
-          ? 'Trashing…'
-          : 'Move ' + state.dupePending + ' Duplicates to Trash' +
-            (scanning ? ' (pause the scan first)' : '');
+        if (trashing) {
+          del.disabled = stopping;
+          del.innerText = stopping ? 'Pausing…' : 'Pause Trashing';
+        } else {
+          // Trashing needs the script lock, which a running scan holds — pause it first.
+          del.disabled = scanning;
+          del.title = scanning ? 'Pause the scan first' : '';
+          del.innerText = 'Move ' + state.dupePending + ' Duplicates to Trash' +
+                          (scanning ? ' (pause the scan first)' : '');
+        }
       } else {
         del.style.display = 'none';
       }
@@ -130,23 +141,72 @@
      */
     function paintBackground() {
       const btn = document.getElementById('bgBtn');
+      const trashBtn = document.getElementById('bgTrashBtn');
       const note = document.getElementById('bgNote');
       const bg = state.background || {};
-      const worthOffering = bg.running || state.phase || state.linksPending;
+      const budget = bg.usedMin + ' of ' + bg.budgetMin + ' min used today';
 
-      if (!worthOffering) {
-        btn.style.display = 'none';
-        note.innerText = '';
-        return;
-      }
-      btn.style.display = 'block';
-      btn.disabled = false;
+      // Scanning in the background: offered while there is a walk to continue.
+      const offerScan = bg.running || state.phase || state.linksPending;
+      btn.style.display = offerScan ? 'block' : 'none';
+      btn.disabled = bg.trashRunning;
       btn.innerText = bg.running ? 'Stop Background Scan' : 'Run in the Background (computer can be off)';
-      note.innerHTML = bg.running
-        ? '<b>Running on Google\'s servers</b> every ' + bg.everyMinutes + ' min — this tab can be ' +
-          'closed. ' + bg.usedMin + ' of ' + bg.budgetMin + ' min used today. Never trashes.'
-        : 'Hands the scan to a server-side trigger so it continues with your computer off. ' +
-          'Limited to ' + (bg.budgetMin || 300) + ' min/day.';
+
+      // Trashing in the background: offered once there is a reviewed list to work through.
+      const offerTrash = bg.trashRunning || (state.dupePending && !scanning && !trashing);
+      trashBtn.style.display = offerTrash ? 'block' : 'none';
+      trashBtn.disabled = bg.running;
+      trashBtn.innerText = bg.trashRunning
+        ? 'Stop Background Trashing'
+        : 'Trash ' + state.dupePending + ' in the Background (computer can be off)';
+
+      if (bg.trashRunning) {
+        note.innerHTML = '<b>Trashing on Google\'s servers</b> every ' + bg.everyMinutes +
+          ' min — this tab can be closed. ' + budget + '. Stops itself when the list is done.';
+      } else if (bg.running) {
+        note.innerHTML = '<b>Scanning on Google\'s servers</b> every ' + bg.everyMinutes +
+          ' min — this tab can be closed. ' + budget + '. Never trashes.';
+      } else if (offerScan || offerTrash) {
+        note.innerHTML = 'Background jobs run with your computer off, one at a time, sharing ' +
+          (bg.budgetMin || 300) + ' min/day of runtime (' + budget + ').';
+      } else {
+        note.innerText = '';
+      }
+    }
+
+    /**
+     * Unattended trashing is the only irreversible thing that can happen with nobody
+     * watching, so it takes an explicit confirmation every time it is switched on.
+     */
+    function toggleBackgroundTrash() {
+      const bg = state.background || {};
+      const btn = document.getElementById('bgTrashBtn');
+      const on = !bg.trashRunning;
+
+      if (on && !confirm('Trash ' + state.dupePending + ' files in the background?\n\n' +
+          'Every row of the Duplicates sheet with an empty Status will be moved to Drive Trash, ' +
+          'with no browser open — including rows hidden by a filter.\n\n' +
+          'Rows you deleted from the sheet are not touched, and nothing outside the sheet is ' +
+          'touched. A duplicate whose original is already in the trash is skipped.\n\n' +
+          'Uses the same ' + (bg.budgetMin || 300) + ' min/day budget as scanning and stops ' +
+          'itself when the list is done. Trashed files stay recoverable for 30 days.')) return;
+
+      btn.disabled = true;
+      google.script.run.withSuccessHandler(res => {
+        if (res && res.error) say('<b class="err">' + res.error + '</b>');
+        else if (on) {
+          say('<b>Background trashing is on.</b><span class="note"> It works through the sheet ' +
+              'on Google\'s servers — close this tab if you like. It stops by itself when every ' +
+              'row has a Status.</span>');
+        } else {
+          say('<b>Background trashing is off.</b><span class="note"> Rows already handled keep ' +
+              'their Status.</span>');
+        }
+        refreshState();
+      }).withFailureHandler(err => {
+        btn.disabled = false;
+        say('<b class="err">Could not change background trashing:</b> ' + errText(err));
+      }).setBackgroundTrash(on, true);
     }
 
     function toggleBackground() {
@@ -224,6 +284,26 @@
 
     /* ------------------------------------------------------------------- scan */
 
+    /* The main button is Analyze/Resume when idle and Pause while a scan is looping. */
+    function mainAction() {
+      if (scanning) return pauseScanning();
+      startScan();
+    }
+
+    /**
+     * Stops a running scan without comparing. requestPause runs in its own execution, so it
+     * works even while the current chunk holds the lock; the chunk then stops at the next
+     * folder boundary with its checkpoint saved.
+     */
+    function pauseScanning() {
+      stopping = true;
+      wantCompare = false;
+      paintButtons();
+      say('<b>Pausing…</b><span class="note"> the scan stops at the next folder — usually a ' +
+          'few seconds. Everything scanned so far is saved.</span>');
+      google.script.run.requestPause();
+    }
+
     function startScan() {
       const url = document.getElementById('url').value || scanUrl;
       if (!state.phase && !/^https?:/.test(url)) {
@@ -231,6 +311,7 @@
       }
       scanUrl = url;
       scanning = true;
+      stopping = false;
       failures = 0;
       wantCompare = false;
       paintButtons();
@@ -252,6 +333,14 @@
      * to surface as a dead "Failed: undefined" with no way forward.
      */
     function handleScanFailure(err) {
+      // Paused: stop here rather than retrying, since a fresh run clears the pause request.
+      if (stopping) {
+        stopping = false;
+        scanning = false;
+        stopPolling();
+        say('<b>Scan paused.</b> Nothing is running.');
+        return refreshState();
+      }
       // A pause was requested: don't restart the scan (a fresh run clears the request),
       // just go compare what is on the sheet. That is what the user asked for anyway.
       if (wantCompare) {
@@ -296,15 +385,30 @@
 
       if (res.paused) {
         scanning = false;
+        stopping = false;
         stopPolling();
-        say('<b>Scan paused</b> after ' + res.count + ' files. Comparing what is scanned so far…');
-        if (wantCompare) { wantCompare = false; runCompare(); }
-        else refreshState();
+        if (wantCompare) {
+          wantCompare = false;
+          say('<b>Scan paused</b> after ' + res.count + ' files. Comparing what is scanned so far…');
+          runCompare();
+        } else {
+          say('<b>Scan paused</b> after ' + res.count + ' files. Nothing is running. Click ' +
+              '<b>Resume Scan</b> to continue, or trash what has already been found.');
+          refreshState();
+        }
         return;
       }
 
       if (res.timeout) {
         // The chunk ended on its own before the pause request reached it — same thing.
+        if (stopping) {
+          stopping = false;
+          scanning = false;
+          stopPolling();
+          say('<b>Scan paused</b> after ' + res.count + ' files. Nothing is running.');
+          refreshState();
+          return;
+        }
         if (wantCompare) {
           wantCompare = false;
           scanning = false;
@@ -316,6 +420,13 @@
         // Honour a pause clicked during the gap: a new chunk would clear the request
         // on the server and the user would wait out another full execution.
         setTimeout(() => {
+          if (stopping) {                        // paused during the 3-second gap
+            stopping = false;
+            scanning = false;
+            stopPolling();
+            say('<b>Scan paused.</b> Nothing is running.');
+            return refreshState();
+          }
           if (!wantCompare) return callScan();
           wantCompare = false;
           scanning = false;
@@ -411,13 +522,32 @@
 
     /* ------------------------------------------------------------------ trash */
 
+    /* The trash button is Move-to-Trash when idle and Pause while trashing. */
+    function trashAction() {
+      if (trashing) return pauseTrashing();
+      confirmDelete();
+    }
+
+    /**
+     * Trashing has no server-side pause flag — and should not: a half-trashed file is not a
+     * thing. The chunk in flight finishes and marks its rows, then the loop stops.
+     */
+    function pauseTrashing() {
+      stopping = true;
+      paintButtons();
+      say('<b>Pausing…</b><span class="note"> the batch in progress finishes first (up to a ' +
+          'few minutes), then it stops. Every file already handled is marked in the sheet.</span>');
+    }
+
     function confirmDelete() {
       if (!confirm('Move ' + state.dupePending + ' files to Trash?\n\nThe newest copy of each file stays; ' +
                    'only the older copies are trashed. Trashed files remain recoverable from Drive Trash.')) return;
       trashing = true;
+      stopping = false;
       paintButtons();                                      // no other job may start now
       window.trashedTotal = 0;
       window.errorTotal = 0;
+      window.skippedTotal = 0;
       failures = 0;
       busyWaits = 0;
       startPolling();
@@ -441,19 +571,28 @@
         }
         window.trashedTotal += (res.trashed || 0);
         window.errorTotal += (res.errors || 0);
+        window.skippedTotal += (res.skipped || 0);
         if (res.error) return handleTrashFailure({ message: res.error });
 
         failures = 0;
         busyWaits = 0;
+        const tail = (window.errorTotal ? ', ' + window.errorTotal + ' failed' : '') +
+                     (window.skippedTotal ? ', ' + window.skippedTotal + ' skipped (original ' +
+                      'already in the trash)' : '');
+        if (stopping) {
+          stopping = false;
+          return endTrash('<b>Trashing paused.</b> ' + window.trashedTotal + ' file(s) trashed' +
+                          tail + '.<br><span class="note">Click the button again to continue — ' +
+                          'rows already marked are skipped.</span>');
+        }
         if (res.remaining > 0) {
           say('<b>Trashing…</b> ' + window.trashedTotal + ' done, ' + res.remaining +
               ' to go. Continuing past the 6-minute limit…');
           setTimeout(runTrash, 2000);
           return;
         }
-        endTrash('<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' +
-                 (window.errorTotal ? ', ' + window.errorTotal + ' failed — see the Status column in the ' +
-                  'Duplicates sheet.' : '.'));
+        endTrash('<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' + tail +
+                 (window.errorTotal || window.skippedTotal ? ' — see the Status column in the Duplicates sheet.' : '.'));
       }).withFailureHandler(handleTrashFailure).trashDuplicates();
     }
 

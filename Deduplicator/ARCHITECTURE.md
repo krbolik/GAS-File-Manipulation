@@ -348,23 +348,66 @@ tool safe to interrupt at any point:
 Nothing in the server keeps a job moving; something has to ask for the next slice. There are
 two things that can do that, and they are interchangeable because **neither holds state**.
 
-| | Dialog (`Progress.html`) | Time-driven trigger (`backgroundScanTick`) |
+| | Dialog (`Progress.html`) | Time-driven triggers |
 |---|---|---|
 | Requires | An open browser tab, machine awake | Nothing — runs on Google's servers |
 | Cadence | Immediately after each reply (3 s gap) | Every `BG_EVERY_MINUTES` = 5 min |
 | Duty cycle | ~100 % while open | ~90 % (4.5 min of work per 5 min) |
-| Can trash | **Yes**, on explicit confirmation | **No, by design** |
 | Runtime budget | The account's own daily quota | Additionally capped at `BG_DAILY_BUDGET_MS` = 5 h/day |
-| Stops when | The tab closes or the job finishes | The job finishes, a pause is requested, or the daily cap is hit |
+| Stops when | Paused, the tab closes, or the job finishes | The job finishes, a pause is requested, or the daily cap is hit |
 
-### Why the trigger will not trash
+There are **two** trigger handlers, deliberately separate and mutually exclusive:
+
+| Handler | Does | Guard on enabling |
+|---|---|---|
+| `backgroundScanTick` | Scan → compare → decorate. **Never trashes.** | Refuses if the trash runner is installed |
+| `backgroundTrashTick` | Works through the reviewed Duplicates sheet | Requires `confirmed === true` *every* time, and refuses if the scan runner is installed |
+
+One background job at a time, because they contend for the same lock and draw on the same
+ledger. Each removes its own trigger when its work is done, so re-enabling always means
+re-confirming.
+
+### Why the *scan* trigger will not trash
 
 Discovery, comparison and decoration are all reversible: they read Drive and write a derived
-sheet. Trashing is the one irreversible step, and it is the one thing that should never happen
+sheet. Trashing is the one irreversible step, so it is not something a scan should drift into
 while nobody is watching — a mistaken keeper choice discovered the next morning is worth far
-less than one caught before confirming. So `backgroundScanTick` drives the scan, the compare
-and the decoration, then removes its own trigger and leaves the sheet for a human. The harness
-asserts this directly: no tick ever calls `setTrashed`.
+less than one caught before confirming. `backgroundScanTick` therefore stops at a reviewable
+sheet, and the harness asserts it: no scan tick ever calls `setTrashed`.
+
+Unattended trashing exists as its own opt-in because a 72,000-row list is ~7 h of runtime —
+more than a day's quota and far more than anyone will sit through. The distinction that makes
+it safe is *when* the human decision happens: by the time this runs, the list has already been
+reviewed, and the runner is only executing it.
+
+### What the trash path is allowed to touch
+
+`trashOneRow` is the single gate, used by both schedulers. A row is acted on only if it:
+
+1. **is present in the Duplicates sheet** — re-read from the sheet on every batch, never
+   cached in properties, so a row the reviewer deletes is gone for good and is never trashed;
+2. **has an empty Status** — nothing is trashed twice;
+3. **carries a hash and a well-formed file ID** (`looksLikeFileId`: URL-safe characters only,
+   so a filename or a stray sentence in the wrong column is refused, not obeyed) — i.e. the row
+   was written by this tool rather than typed;
+4. **names an original that is still alive** (`isFileAlive`, one Drive read per family, cached
+   per execution, switchable via `VERIFY_KEEPER`).
+
+Rule 4 is the interesting one. It exists because of a failure actually observed in this
+project: a layout migration cleared the sheet from a non-compare code path, taking the recorded
+swap decisions with it. A rebuilt sheet then reapplied the date rule, which for a swapped pair
+nominates the copy that had *already been trashed* as the keeper — and would have listed the
+survivor for trashing, leaving a set of identical files with nothing live. The check turns that
+into `Skipped: the original is already in the trash`, which is recoverable: ticking **Swap ⇄**
+on the row flips the sides and clears the Status, so it is retried against the live copy.
+
+An unreadable original counts as *not alive*, so an unverifiable keeper blocks its duplicates
+rather than waving them through.
+
+The background trash runner adds two refusals of its own: it will not run if the sheet's header
+row does not match the current layout (rather than letting `getSheet` migrate it, which clears
+rows), and it never compares — so deleted rows cannot be regenerated behind the reviewer's back
+and then trashed.
 
 ### Yielding to the reviewer
 
@@ -383,8 +426,13 @@ the person:
 Google gives Workspace accounts roughly **6 h/day** of trigger runtime. Spending all of it
 would starve the owner's other scheduled scripts, which draw on the same per-user pool. So the
 runner keeps its own ledger — `BG_DAY` plus `BG_USED_MS` in properties, wall-clock per tick,
-reset when the date rolls over in the script's timezone — and stops working at **5 h**, leaving
-about an hour. Two details:
+**shared between the scan and trash runners** — and stops working at **5 h**, leaving about an
+hour.
+
+The ledger's day rolls at midnight in `QUOTA_TZ` = `America/Los_Angeles`, **not** the script's
+own timezone. Apps Script's daily quotas reset at midnight Pacific; a ledger rolling at midnight
+Berlin would hand out a fresh 5 h nine hours early, and those ticks would run straight into a
+quota that had not reset yet. Two further details:
 
 - **The cap does not uninstall the trigger.** Ticks keep firing and returning immediately
   (a second or so each), so work resumes by itself after midnight with no human action.
@@ -582,7 +630,9 @@ contend for the same lock and checkpoint.
 
 | Invariant | Mechanism |
 |---|---|
-| **Every content group keeps at least one copy** | n copies produce n−1 rows, so at most n−1 distinct files can ever be trashed — *regardless* of how the reviewer swaps rows |
+| **Every content group keeps at least one copy** | n copies produce n−1 rows, so at most n−1 distinct files can ever be trashed — *regardless* of how the reviewer swaps rows. Reinforced at the point of deletion by rule 4 of `trashOneRow`, which refuses a duplicate whose original is already in the trash |
+| **A row deleted from the sheet is never trashed** | The list is re-read from the sheet on every batch and never cached, so deletion takes effect immediately and permanently |
+| **Only rows this tool wrote can trigger a deletion** | `trashOneRow` requires a hash and a URL-safe file ID; hand-typed or mis-pasted rows are refused as `Error:` |
 | Compare is idempotent | Rebuilding the list yields the same rows; `Status` carries over by file ID, reviewer swaps carry over by unordered pair key |
 | No work is lost to a failure | Every slice checkpoints before exiting; every failure is returned as `{error, resumable}` rather than thrown at the client |
 | Trashing never repeats | Per-row `Status` gates re-attempts; re-trashing an already-trashed file is a no-op anyway |
@@ -629,8 +679,8 @@ blip without a human deciding anything.
 | Hash bucketing, keeper choice | `runDeduplication`, `pickKeeper` |
 | Streaming a large sheet | `forEachDataRow` |
 | Resumable cosmetics | `decorateRows`, `finishPendingLinks`, `lastDuplicateRow`, `linkRuns` |
-| Unattended scheduling | `setBackgroundScan`, `backgroundScanTick`, `bgBudget`, `bgSpend`, `removeBackgroundTriggers`, `backgroundInfo` |
-| Irreversible stage | `trashDuplicates` |
+| Unattended scheduling | `setBackgroundScan`, `backgroundScanTick`, `setBackgroundTrash`, `backgroundTrashTick`, `bgBudget`, `bgSpend`, `removeTriggers`, `triggerExists`, `backgroundInfo` |
+| Irreversible stage | `trashDuplicates`, and its per-row gate `trashOneRow` / `looksLikeFileId` / `isFileAlive` |
 | Reviewer overrides | `onEdit`, `swapSelectedRows`, `selectedDataRows`, `swapKeeper`, `readPairChoices` |
 | Resilience primitives | `withRetry`, `isTransient`, `describeError`, `busyReply` |
 | Layout migration | `getSheet`, `writeHeaders`, `headersMatch`, `readByHeaders` |
@@ -644,12 +694,14 @@ blip without a human deciding anything.
 The logic is exercised against a **fake Sheets/Drive API** (an in-memory sheet model with
 ranges, rich text, checkboxes, filters and selections, plus a fake trigger registry) so that
 column layouts, the keeper rule, swap semantics, repeat collapsing, status carry-over, layout
-migration, deferred decoration and the background runner's lifecycle are all asserted without
-touching a real spreadsheet — currently 91 assertions.
+migration, deferred decoration and both background runners' lifecycles are all asserted without
+touching a real spreadsheet — currently 118 assertions.
 
 Notable among them, because they encode promises rather than mechanics: a repeated file record
 is never reported as a duplicate of itself; a swap of every row in a family over-keeps instead
-of destroying; and **no background tick ever calls `setTrashed`**.
+of destroying; **no scan tick ever calls `setTrashed`**; a duplicate whose original is already
+in the trash is skipped; an unverifiable original blocks trashing too; and **a row cleared from
+the sheet is never trashed by a background tick**.
 
 Two limits worth stating plainly: the harness models the API's *contract*, not Google's
 performance, so **no memory or timing claim in §7 is measured** — those are reasoned
