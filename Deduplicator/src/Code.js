@@ -727,8 +727,30 @@ function swapKeeper(sh, row) {
  * to be found in.
  */
 function compareScannedSoFarMenu() {
-  const res = compareScannedSoFar();
   const ui = SpreadsheetApp.getUi();
+
+  /*
+   * With no scan in progress the comparison has already run — processFolder does it itself
+   * the moment the walk finishes. Reaching this item then means rebuilding a list that is
+   * already complete, which regenerates every row the reviewer deleted on purpose, with an
+   * empty Status, i.e. queued for trashing. Worth one question.
+   */
+  const props = PropertiesService.getScriptProperties();
+  if (!props.getProperty(P_PHASE)) {
+    const existing = pendingTrashCount();
+    const answer = ui.alert(
+        'Rebuild the duplicate list?',
+        'The scan and the comparison are already finished, so there is nothing new to ' +
+        'compare.\n\nRebuilding re-reads every scanned file and replaces the "' + DUPES_SHEET +
+        '" sheet. Rows you deleted from it will come back, with an empty Status — meaning they ' +
+        'would be trashed on the next run. Trashed marks and Swap decisions are kept for the ' +
+        'rows that remain' + (existing.pending ? ' (' + existing.pending + ' still pending)' : '') +
+        '.\n\nRebuild anyway?',
+        ui.ButtonSet.YES_NO);
+    if (answer !== ui.Button.YES) return ui.alert('Nothing was changed.');
+  }
+
+  const res = compareScannedSoFar();
   if (res.error) return ui.alert(res.error);
   ui.alert(res.dupeCount + ' duplicate(s) found among ' + res.totalFiles +
            ' file(s) scanned so far' + (res.partial ? ' (scan incomplete — resume it from the dialog).' : '.') +

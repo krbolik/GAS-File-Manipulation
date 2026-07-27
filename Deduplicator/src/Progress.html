@@ -25,6 +25,7 @@
     <input type="text" id="url" placeholder="Paste Google Drive URL here...">
     <button id="mainBtn" class="btn" onclick="mainAction()">Analyze Folder</button>
     <button id="cmpBtn" class="btn secondary" style="display:none" onclick="compareNow()"></button>
+    <div id="doneNote" class="note" style="margin-top:8px"></div>
     <button id="bgBtn" class="btn secondary" style="display:none" onclick="toggleBackground()"></button>
     <button id="bgTrashBtn" class="btn secondary" style="display:none" onclick="toggleBackgroundTrash()"></button>
     <div id="bgNote" class="note" style="margin-top:6px"></div>
@@ -103,16 +104,36 @@
         main.innerText = state.phase ? 'Resume Scan' : 'Analyze Folder';
       }
 
+      /*
+       * The compare button is only offered while there is something left to compare. Once
+       * the walk has finished, processFolder has already run the comparison itself and
+       * deleted the phase marker — so a button reading "Compare N Scanned Files Now" would
+       * be inviting a rebuild nobody needs, and a rebuild brings back rows the reviewer
+       * deleted on purpose. A sentence replaces it; the menu keeps the deliberate route.
+       */
+      const done = document.getElementById('doneNote');
+      const finished = !state.phase && state.scannedFiles;
+
       if (scanning) {
         cmp.style.display = 'block';
         cmp.innerText = 'Pause & Compare What Is Scanned So Far';
         cmp.disabled = wantCompare;
+        done.innerText = '';
+      } else if (finished) {
+        cmp.style.display = 'none';
+        done.innerHTML = '<b>Scan complete — nothing left to compare.</b> ' +
+          num(state.scannedFiles) + ' files scanned, ' + num(state.dupeTotal) + ' duplicates listed' +
+          (state.dupePending ? ', ' + num(state.dupePending) + ' still to trash' : ' and all handled') +
+          '.<br>Rebuilding the list is possible from 🚀 Angel → Compare Files Scanned So Far, ' +
+          'but it brings back rows you deleted.';
       } else if (state.scannedFiles) {
         cmp.style.display = 'block';
-        cmp.innerText = 'Compare ' + state.scannedFiles + ' Scanned Files Now';
+        cmp.innerText = 'Compare ' + num(state.scannedFiles) + ' Scanned Files Now';
         cmp.disabled = trashing;
+        done.innerText = '';
       } else {
         cmp.style.display = 'none';
+        done.innerText = '';
       }
 
       paintBackground();
@@ -253,6 +274,9 @@
     }
 
     function say(html) { document.getElementById('results').innerHTML = html; }
+
+    /** Thousands separators: six-figure counts are unreadable without them. */
+    function num(n) { return Number(n || 0).toLocaleString(); }
 
     /**
      * Handles "the lock is held by another execution": wait, then call `again`. The lock
@@ -445,6 +469,13 @@
     /* ---------------------------------------------------------------- compare */
 
     function compareNow() {
+      // Replacing an existing list is not free: rows deleted on purpose come back, with an
+      // empty Status, which means they would be trashed on the next run.
+      if (state.dupeTotal && !confirm('Rebuild the duplicate list?\n\n' +
+          'The current list of ' + num(state.dupeTotal) + ' rows is replaced by a fresh ' +
+          'comparison.\n\nRows you deleted from the sheet will come back. Trashed marks and ' +
+          'your Swap decisions are kept for the rows that remain.')) return;
+
       document.getElementById('cmpBtn').disabled = true;
       if (!scanning) return runCompare();
       wantCompare = true;

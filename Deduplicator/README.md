@@ -39,7 +39,8 @@ Trashing is always the last step and always manual.
 | **Pause Scanning** | What the top button becomes while a scan is running. Stops at the next folder — a few seconds — without comparing. Closing the dialog still works too |
 | **Pause Trashing** | What the trash button becomes while trashing. The batch in flight finishes (up to a few minutes), then it stops. Click the trash button again to continue |
 | **Pause & Compare What Is Scanned So Far** | Stops the walk at the next folder and lists the duplicates found up to that point, so you can trash them without waiting for the rest |
-| **Compare N Scanned Files Now** | Same thing when no scan is running: rebuilds the duplicate list from everything scanned so far |
+| **Compare N Scanned Files Now** | Only shown while a scan is **unfinished**: compares everything scanned so far, so you can trash without waiting for the rest. Asks first if it would replace an existing list |
+| *"Scan complete — nothing left to compare"* | Replaces that button once the walk is done. The comparison already ran automatically at the end of the scan, so there is nothing to press |
 | **Run in the Background (computer can be off)** | Hands the scan to Google's servers. Continues every 5 minutes with the tab closed and the machine off. Max 5 hours per day. **Never trashes** |
 | **Stop Background Scan** | Cancels that, so you can drive it by hand again |
 | **Trash N in the Background (computer can be off)** | Works through the Duplicates sheet unattended, same 5 h/day budget. Asks for confirmation every time it is switched on, and stops itself when every row has a Status. Only one background job runs at a time |
@@ -414,6 +415,23 @@ show `Error: …` and can be retried by the owner). See
   letting `getSheet` migrate it, since migration clears rows — and it never compares, so
   deleted rows are never silently regenerated and then trashed.
 
+**v5.9** — no button that invites a mistake. `processFolder` is one pipeline: when the walk
+finishes, that same execution sets the phase to `DEDUPE`, runs the comparison, and deletes the
+phase marker. So a completed scan has *already* compared — yet the dialog still offered
+*"Compare 315041 Scanned Files Now"*, which read like pending work and, if pressed, rebuilt the
+list from scratch. That matters because **a rebuild resurrects rows the reviewer deleted**, with
+an empty Status, which queues them for trashing — the exact opposite of the intent behind
+deleting them.
+
+- Once the phase marker is empty, the button is replaced by a sentence: *"Scan complete —
+  nothing left to compare. 315,041 files scanned, 72,308 duplicates listed, 72,308 still to
+  trash."* The **paused/partial case keeps the button**, since comparing an unfinished scan is
+  a real feature.
+- Hiding a button only lowers the odds, so both remaining routes now ask first. The dialog
+  confirms whenever a compare would replace an existing list, and **🚀 Angel → Compare Files
+  Scanned So Far** confirms when no scan is in progress — spelling out that deleted rows will
+  come back. A partial scan still compares without a prompt.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
@@ -527,5 +545,3 @@ Because it is bound, the `onOpen` **🚀 Angel** menu appears automatically in t
 spreadsheet, and `SpreadsheetApp.getUi()` works. To open the code from the sheet:
 **Extensions → Apps Script**. `clasp pull` / `clasp push` sync this repo with that same
 bound project (scriptId `1U_Ej4u1kFRmR3ywpdnCHmbjImRxuNzZmIu5DRHMw6SpKpHFKzrH-k2lb`).
-
-Todo:
