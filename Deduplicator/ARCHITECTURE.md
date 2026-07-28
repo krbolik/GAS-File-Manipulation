@@ -329,7 +329,9 @@ flowchart TD
 | **Swap ⇄** (checkbox or menu) | `onEdit` / `swapSelectedRows` → `swapKeeper` | 8 cells + ID + `Status` clear, in that row only | **None** | Yes — swap again to revert |
 | **Delete a row by hand** | — | `Duplicates` only | None | Only until the next compare, which regenerates it |
 | **Sort / filter the sheet** | — | Nothing | None | Yes — no state is positional |
-| **Move Duplicates to Trash** | `trashDuplicates` | `Status` per row, batched 50 | **Trashes files** | Only via Drive Trash |
+| **Pause Scanning / Pause Trashing** | `requestPause` (cache) / client `stopping` flag | Nothing beyond the current batch's checkpoint | None | Yes — resume with the same button |
+| **Move Duplicates to Trash** | `trashDuplicates` → `trashOneRow` | `Status` per row, batched 50 | **Trashes files** | Only via Drive Trash |
+| **Trash in the Background** | `setBackgroundTrash` → `backgroundTrashTick` | Installs a trigger; then as above | **Trashes files, unattended** | Only via Drive Trash. Needs confirming on every enable |
 | **Reset Scan Progress** | `resetToken` | Clears all three sheets + all properties + cache | None | **No** — the scan and the audit trail are gone |
 
 Two properties of this pipeline are worth stating explicitly, because they are what make the
@@ -575,18 +577,32 @@ reported as a duplicate *of itself*. `runDeduplication` de-duplicates by file ID
 in; the test suite asserts this for both mechanisms that produce repeats (stale-page-token
 re-listing, and a file reachable through two parents).
 
-### 7.3 Spreadsheet capacity — 10 million cells, shared
+### 7.3 Spreadsheet capacity — 10 million cells, counted by *grid*, not by data
 
-| Sheet | Cells | At N = 100k / F = 20k / D = 10k |
-|---|---|---|
-| `_scan_files` | 6 × N | 600 000 |
-| `_scan_queue` | 2 × F | 40 000 |
-| `Duplicates` | 14 × D | 140 000 |
-| **Total** | | **~0.8 M of 10 M (8 %)** |
+**This limit was hit in production, and the reason it was hit is instructive: Sheets counts
+every cell in a sheet's grid, not the populated ones.** A sheet is 26 columns wide by default,
+and when `appendRows` grows the row count with `insertRowsAfter` it grows the whole width. So
+`_scan_files` storing six columns of data consumed twenty-six columns of budget:
 
-Headroom is large: the hard wall is around **N ≈ 1.5 M files**. Note the quota is
-per-*spreadsheet*, so the checkpoint sheets and the human-facing result compete for the same
-budget — reviewer-added helper columns count too.
+| Sheet | Data columns | Cells charged (default 26-wide grid) | At N = 315 k |
+|---|---|---|---|
+| `_scan_files` | 6 | **26 × N** | **8.19 M** |
+| `_scan_queue` | 2 | 26 × F | 26 × F |
+| `Duplicates` | 14 | 26 × D | 26 × D |
+
+That put the workbook at the 10 M ceiling at roughly **380 k rows**, whereupon every append
+failed with *"This action would increase the number of cells in the workbook above the limit"* —
+which presents as "the scan silently stops recording", because the error surfaces only in the
+status line and is not transient, so retries cannot clear it.
+
+**The fix is to delete the unused columns** (keep A–F on `_scan_files`, A–B on `_scan_queue`),
+which reclaims ~6–7 M cells without touching any data and moves the ceiling to ~1.6 M rows. It
+is a manual, one-off operation — the script never trims a grid itself, and deliberately so:
+narrowing a sheet is destructive if the layout is ever wrong about which columns matter.
+
+Two corollaries: the quota is per-*spreadsheet*, so checkpoint sheets and the reviewable result
+compete for one budget (reviewer-added helper columns included); and **a duplicated backup tab
+costs its own full grid**, so exporting to CSV is the cheaper way to keep a copy.
 
 ### 7.4 Platform quotas — the constraint people forget
 
@@ -695,7 +711,7 @@ The logic is exercised against a **fake Sheets/Drive API** (an in-memory sheet m
 ranges, rich text, checkboxes, filters and selections, plus a fake trigger registry) so that
 column layouts, the keeper rule, swap semantics, repeat collapsing, status carry-over, layout
 migration, deferred decoration and both background runners' lifecycles are all asserted without
-touching a real spreadsheet — currently 118 assertions.
+touching a real spreadsheet — currently 123 assertions.
 
 Notable among them, because they encode promises rather than mechanics: a repeated file record
 is never reported as a duplicate of itself; a swap of every row in a family over-keeps instead
@@ -706,7 +722,11 @@ the sheet is never trashed by a background tick**.
 Two limits worth stating plainly: the harness models the API's *contract*, not Google's
 performance, so **no memory or timing claim in §7 is measured** — those are reasoned
 estimates, and the 2 × 10⁵ threshold in §7.1 in particular is an untested projection. And
-the harness is a development artefact, not part of the deployed script.
+the harness is a development artefact, not part of the deployed script — **and it is not
+committed to this repository.** It has so far lived in the working session's scratchpad, so the
+assertion count above documents work that a later reader cannot re-run. Committing it (say as
+`test/simulate.js`) is the obvious next step; until then, treat every invariant in §8 as
+verified-once rather than continuously.
 
 ---
 

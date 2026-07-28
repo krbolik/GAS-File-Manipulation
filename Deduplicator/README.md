@@ -5,6 +5,11 @@ tool that recursively scans a Google Drive folder, finds duplicate files by cont
 hash, and moves them to Trash. The script is bound to the **"DuplicateFinder"** Google
 Sheet ([open it](https://docs.google.com/spreadsheets/d/1DZuoYcTXyTV35llQlO3qmTK6m4NDH3h6-P6R7Jru9D0/edit)).
 
+> **[STATUS.md](STATUS.md)** — where the code and the live job actually stand right now, plus
+> the two live conditions (lost swap metadata, the cell-limit trim) that change what is safe to
+> do. **[HANDOFF.md](HANDOFF.md)** — what was done, what is left, known defects. Read both
+> before resuming work.
+>
 > **[ARCHITECTURE.md](ARCHITECTURE.md)** — the design document: component model, the
 > search algorithm (hash bucketing, Θ(N) — *not* the pairwise Θ(N²) it is often assumed
 > to be), complexity and capacity tables, ranked scalability constraints with thresholds,
