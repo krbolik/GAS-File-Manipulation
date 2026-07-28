@@ -24,10 +24,10 @@ Folder: `1uxLwAGVB94mzZlM-g7G3pjfk-FLYBVa1` · Sheet: `1DZuoYcTXyTV35llQlO3qmTK6
 |---|---|
 | `_scan_files` | ~315,041 records |
 | Walk | **Reported complete** — the last analysis found no phase marker and no installed trigger, i.e. `processFolder` finished the walk, ran the comparison itself and deleted the phase. **Verify from the dialog before acting**: *Analyze Folder* = complete, *Resume Scan* = not |
-| `Duplicates` | **72,308 rows, all with an empty Status** — i.e. all pending |
-| Trashed so far | ~2,508 files (earlier in the session). **Their Status marks no longer exist** — see below |
-| Background jobs | None installed at last check |
-| Daily budget | Shared 5 h ledger; ~28 min recorded spent on the day of the last check |
+| `Duplicates` | 72,308 rows, all pending when the run began |
+| **Trashing** | **Started 2026-07-28 and reported working.** Not confirmed finished — validate with the procedure below |
+| Trashed earlier | ~2,508 files, before the list was rebuilt. **Those Status marks no longer exist** — see below |
+| Daily budget | Shared 5 h ledger, day rolling at midnight US Pacific |
 
 ### Two live conditions the next session must respect
 
@@ -54,14 +54,72 @@ trim survived** (`_scan_files`, `Cmd+→`, last column should be F). At this doc
 also throws intermittent *"Service Spreadsheets failed while accessing document"* — transient,
 retried, and expected rather than alarming.
 
+## Validating the trash run
+
+Written to be usable with no memory of the session that started the run. Column letters are
+the v5.6+ layout: **K** = `Duplicate ID`, **L** = `Hash`, **M** = `Status`, **B** / **F** = the
+duplicate's and the original's links, **J** = `Copies`.
+
+### 1. The four counts must add up
+
+Paste into any empty cells to the right of column N of the **Duplicates** sheet:
+
+```
+=COUNTIF(K2:K,"<>")                       ' rows in the list
+=COUNTIF(M2:M,"Trashed")                  ' done
+=COUNTIFS(K2:K,"<>",M2:M,"")              ' still pending
+=COUNTIF(M2:M,"Error*")                   ' attempted and failed
+=COUNTIF(M2:M,"Skipped*")                 ' refused by the safety guard
+```
+
+`Trashed + pending + Error + Skipped` must equal the row count. If it does not, some Status
+cell holds something unexpected — sort by column M and look at the odd values. **Pending = 0
+means the run finished**; a non-zero pending count with nothing running means it stopped early,
+and clicking the trash button again resumes safely.
+
+### 2. What each outcome means
+
+| Status | Meaning | Action |
+|---|---|---|
+| `Trashed` | The file is in Drive Trash, recoverable for 30 days | None |
+| *(empty)* | Never attempted | Re-run trashing to continue |
+| `Skipped: the original is already in the trash` | The guard refused, because trashing this copy could have left a set of identical files with **no live copy**. Expected here, as the fingerprint of the swap decisions lost earlier | Review each: tick **Swap ⇄** to flip the sides and retry, or leave it |
+| `Error: …` | Attempted and failed — usually "not yours to delete" if run by a non-owner | Re-run as `kai.bolik@createk.biz`; the message says which |
+
+### 3. Cross-check against Drive, not just the sheet
+
+The sheet records what the script *believes*. Confirm independently:
+
+- **drive.google.com/drive/trash** should hold roughly the `Trashed` count (plus the earlier
+  ~2,508). Drive's trash view is not precisely countable, so treat this as an order-of-magnitude
+  check.
+- **Spot-check 3–5 rows marked `Trashed`**: the link in column B should open a file Drive shows
+  as being in the trash, and the link in column F — its original — must open a **live** file.
+  That pairing is the whole safety property; if an F link is also trashed, stop and investigate
+  before running anything further.
+- **Executions log** (Extensions → Apps Script → Executions, as the account that ran it): lines
+  reading `Dedup trash chunk done {"trashed":…,"errors":…,"skipped":…,"remaining":…}`. The
+  `remaining` of the final line should be 0. `Dedup background trash complete` means the
+  trigger removed itself, i.e. the list was fully worked through.
+
+### 4. The invariant worth confirming by hand
+
+**No set of identical files should have lost every copy.** The code enforces this at two levels
+(*n* copies yield only *n−1* rows, and the keeper check refuses a duplicate whose original is
+already trashed), but it is cheap to sample: filter for `Copies > 2`, pick a few hashes in
+column L, and confirm that each family's column-F original opens a live file. Anything else
+means a real bug, and is worth reporting before further trashing.
+
 ## What is left to do on the job
 
-1. **Trash the 72,308 pending rows** — as `kai.bolik@createk.biz`, since only the owner can
-   trash files in their own My Drive. Roughly 7 h of runtime plus the keeper checks, i.e. two to
-   three days at 5 h/day. Background trashing (v5.8) now does this unattended.
-2. Decide whether anything remains to scan (the walk reports complete; a fresh verification scan
+1. **Confirm the trash run completed** using the procedure above. It needs roughly 7 h of
+   runtime plus the keeper checks, i.e. two to three days at 5 h/day, so expect it to span
+   several sessions. It must run as `kai.bolik@createk.biz` — only the owner can trash files in
+   their own My Drive.
+2. **Work through the `Skipped:` rows** — each is a decision the tool deliberately refused to
+   make.
+3. Decide whether anything remains to scan (the walk reports complete; a fresh verification scan
    after trashing is the only way to be sure).
-3. Optionally reconcile the lost swaps from the 37 k backup before trashing.
 
 ## Known defects, not yet fixed
 

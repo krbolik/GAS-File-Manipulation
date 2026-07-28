@@ -722,11 +722,15 @@ the sheet is never trashed by a background tick**.
 Two limits worth stating plainly: the harness models the API's *contract*, not Google's
 performance, so **no memory or timing claim in §7 is measured** — those are reasoned
 estimates, and the 2 × 10⁵ threshold in §7.1 in particular is an untested projection. And
-the harness is a development artefact, not part of the deployed script — **and it is not
-committed to this repository.** It has so far lived in the working session's scratchpad, so the
-assertion count above documents work that a later reader cannot re-run. Committing it (say as
-`test/simulate.js`) is the obvious next step; until then, treat every invariant in §8 as
-verified-once rather than continuously.
+the harness is a development artefact, not part of the deployed script: it lives at
+[`test/simulate.js`](test/simulate.js) and `.claspignore` keeps pushes to `src/`, so it can
+never reach Apps Script.
+
+```bash
+cd Deduplicator && node test/simulate.js     # exits non-zero if any assertion fails
+```
+
+Run it after any change to `Code.js` — the invariants in §8 are exactly what it pins.
 
 ---
 

@@ -139,6 +139,57 @@ that cannot be undone, and it also deletes the record of what was already trashe
 > empty files match everything, so neither is ever reported. Shortcuts are ignored. The dialog
 > tells you how many files were skipped for these reasons.
 
+## If Swap duplicates operation times out
+
+Unlike the scan and the trashing, swapping is **not resumable**. It works through the selection
+one row at a time and stops dead when Google's execution limit hits — six minutes for **Keep
+Duplicate Instead**, thirty seconds for the **Swap ⇄** box. On a large selection this is normal
+rather than exceptional.
+
+All you see is a red *"Exceeded maximum execution time"* bar. The usual confirmation
+(*"n row(s) swapped"*) never appears, because it is written only after the last row.
+
+**Nothing has been trashed.** Swapping never touches Drive — it only changes which file the
+sheet will trash later.
+
+| | |
+|---|---|
+| The rows it got through | Permanently swapped, from the **top of your selection downward** |
+| The rows below | Untouched |
+| The row it stopped on | May be half-finished — see below |
+| What was recorded | Nothing. There is no saved position and nothing to resume |
+
+### ⚠️ Do not simply run it again
+
+Swapping is its own undo. Running the same selection a second time **flips the finished rows
+back** while flipping the unfinished ones forward — leaving the swap applied to exactly the
+wrong half. Doing it twice more just makes them alternate. Work out where it stopped first,
+then act only on the rows below that point.
+
+### The row it stopped on
+
+One row can be left part-swapped, in one of two ways:
+
+- It reads as swapped but still points at the old file, so trashing would delete the copy you
+  were trying to keep. Tick **Swap ⇄** on that single row to put it back in step, then tick it
+  again if you do still want it swapped.
+- It is swapped correctly but kept its old **Status**, so the trashing pass will skip it. Clear
+  that row's Status cell.
+
+### Working out where it stopped
+
+- **Extensions → Apps Script → Executions** — the `selection resolved` line records how many
+  rows the run *intended* to swap. It does not record how many it finished.
+- On the sheet, a swapped row is one whose **Duplicate Date** is *newer* than its **Original
+  Date**. Two limits: rows swapped in an earlier session look identical, and rows whose two
+  dates are equal or missing cannot be told apart this way.
+
+### Avoiding it
+
+Swap a few hundred rows at a time rather than whole columns. Selecting a column resolves to
+every data row in it — on a sheet of tens of thousands of rows that can never finish within
+the limit.
+
 ---
 
 # Developer reference
@@ -497,6 +548,8 @@ Why the exclusions above exist, in technical terms:
 | `src/appsscript.json` | Apps Script manifest (timezone Europe/Berlin, V8 runtime, Advanced Drive Service v3) |
 | `src/Code.js` | Server-side Apps Script logic |
 | `src/Progress.html` | Client-side dialog UI |
+| `test/simulate.js` | Test harness — runs `src/Code.js` against a fake Sheets/Drive API. `node test/simulate.js`, 123 assertions, non-zero exit on failure. Never pushed to Apps Script |
+| `STATUS.md` / `HANDOFF.md` | Where things stand, and what the next session needs to know |
 | `.clasp.json` | clasp config — `scriptId` + `rootDir: src` |
 | `.claspignore` | Restricts pushes to the three source files |
 

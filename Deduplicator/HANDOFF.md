@@ -29,17 +29,19 @@ operator instructions moved to the top of `README.md`, and this pair of files.
 
 ## What to do first in the next session
 
-1. **Read [STATUS.md](STATUS.md) §"Two live conditions"** — the lost swap metadata and the cell
-   trim. Both change what is safe to do.
-2. **Verify the live state from the dialog** rather than trusting STATUS: top button *Analyze
-   Folder* = walk complete, *Resume Scan* = not. Note the pending count on the red button.
-3. **Start the trash run** as `kai.bolik@createk.biz` — background trashing if it should run
-   overnight. Before that: **export the Duplicates tab to CSV** (File → Download), because the
-   clear-before-write defect means a failed rebuild would take the whole audit trail with it.
-   Do *not* duplicate the tab — a copy costs its own full 26-column grid.
-4. **Watch the first background trash tick** in Extensions → Apps Script → Executions
-   (`Dedup background trash tick`). It has never run in production. Expect some rows to come
-   back `Skipped: the original is already in the trash` — that is the guard working, not a bug.
+**The trash run has been started and was reported working.** So the job has moved on from
+"start trashing" to "confirm it finished correctly".
+
+1. **Run the validation in [STATUS.md](STATUS.md) §"Validating the trash run"** — four counts in
+   the sheet that must add up, plus a spot check against Drive. That section is written to be
+   usable with no memory of this conversation.
+2. **Read STATUS.md §"Two live conditions"** — the lost swap metadata and the cell trim. Both
+   still change what is safe to do.
+3. **Deal with the `Skipped:` rows.** They are the fingerprint of the swap decisions lost
+   earlier: the guard refused to trash a duplicate whose original was already in the bin. Each
+   needs a human decision — tick **Swap ⇄** to flip the sides and retry, or leave it.
+4. **Only then** consider whether anything remains to scan, and whether to fix the two defects
+   below before the next full compare.
 
 ## Important implementation details
 
@@ -76,13 +78,9 @@ operator instructions moved to the top of `README.md`, and this pair of files.
 3. **Compare-stage memory at 315 k records** is in the band documented as untested
    (ARCHITECTURE §7.1). Two mitigations are designed but not built; sort-then-stream is the
    better one.
-4. **The test harness is not in the repository.** 123 assertions — including the invariants that
-   make trashing safe — currently live only in the session scratchpad at
-   `…/scratchpad/simulate.js` and will be lost. **Committing it as `test/simulate.js` is the
-   single highest-value non-urgent task**, and ARCHITECTURE §11 now says so explicitly.
-5. **The 5 h ledger is script-scoped**, so an account handover needs `BG_USED_MS` zeroed by hand
+4. **The 5 h ledger is script-scoped**, so an account handover needs `BG_USED_MS` zeroed by hand
    in Project Settings → Script Properties.
-6. **Drive's `fileSize` for a Google Sheet is a lagging estimate.** I mis-diagnosed once from it;
+5. **Drive's `fileSize` for a Google Sheet is a lagging estimate.** I mis-diagnosed once from it;
    use `modifiedTime` for "is anything writing", and the sheet's own row counts for volume.
 
 ## Things that look like bugs but are not
