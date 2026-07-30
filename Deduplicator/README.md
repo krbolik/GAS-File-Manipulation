@@ -32,8 +32,15 @@ older copy is listed for trashing. Trashed files stay recoverable from Drive Tra
 | 4 | Wait. It resumes itself past every time limit | — |
 | 5 | Review the **Duplicates** sheet: check the links, tick **Swap ⇄** where you want the other copy kept, delete rows you want left alone | Sheet |
 | 6 | Click **Move N Duplicates to Trash** and confirm | Dialog |
+| 7 | Copy the **Duplicates** tab into the [Duplicate backup](https://docs.google.com/spreadsheets/d/1oBnLcYpUcXKo2V25rPn9MSSJGPhbJZVwy6MGpmKyUds/edit) file: right-click the tab → **Copy to** → **Existing spreadsheet** | Sheet |
 
 Trashing is always the last step and always manual.
+
+**Why step 7 matters.** The **Status** column is the only record of what was trashed — Drive
+will not tell you which of two identical files went into the bin on purpose — and *Reset Scan
+Progress* deletes it. Copy it to that **separate** file rather than to a tab in this workbook:
+a tab here costs its own full grid against the spreadsheet's 10-million-cell limit, which this
+workbook has already hit once.
 
 ## The dialog
 
@@ -73,7 +80,9 @@ in the background:
 
 - **Only rows that are in the sheet.** A row you delete is gone from the list and is never
   trashed. Nothing outside the sheet is ever touched, and the list is re-read from the sheet
-  on every batch — it is never cached, so deleting a row takes effect immediately.
+  at the start of every chunk — it is never cached. Delete a row while nothing is running and
+  it takes effect immediately; delete one *during* a run and it drops out at the next chunk,
+  a few minutes later.
 - **Only rows with an empty Status**, so nothing is trashed twice.
 - **Only rows that carry a hash and a well-formed file ID** — i.e. rows this tool wrote. A
   hand-typed or pasted row is refused with `Error:` rather than acted on.
@@ -102,7 +111,7 @@ in the background:
 | **Stop Background Scan** | Same as the dialog button |
 | **Trash Duplicates in the Background** | Same as the dialog button, with a yes/no on the exact row count |
 | **Stop Background Trashing** | Same as the dialog button |
-| **Reset Scan Progress** | ⚠️ Throws the scan and the whole duplicate list away. Only for starting on a different folder |
+| **Reset Scan Progress** | ⚠️ Throws the scan and the whole duplicate list away, stops any background job, and gives the spreadsheet its cells back. Asks first, and reminds you to back the Duplicates tab up. Only for starting on a different folder |
 
 ## Is it finished, or did it stop?
 
@@ -133,7 +142,10 @@ position is saved continuously.
 | You swapped rows by mistake | Nothing has been trashed yet. Rows where the **Duplicate Date** is *newer* than the **Original Date** are the swapped ones; select them and use **Keep Duplicate Instead** to flip them back |
 
 **Never press Reset Scan Progress** unless you truly want to start over — it is the one action
-that cannot be undone, and it also deletes the record of what was already trashed.
+that cannot be undone, and it also deletes the record of what was already trashed. It asks
+first and reminds you to copy the Duplicates tab to the
+[Duplicate backup](https://docs.google.com/spreadsheets/d/1oBnLcYpUcXKo2V25rPn9MSSJGPhbJZVwy6MGpmKyUds/edit)
+file; do that, then answer Yes.
 
 > **Why some duplicates never appear:** Google Docs/Sheets/Slides have no content hash, and
 > empty files match everything, so neither is ever reported. Shortcuts are ignored. The dialog
@@ -197,11 +209,16 @@ the limit.
 Everything below is for working *on* the script rather than *with* it: version history first,
 then how it works internally, then the clasp/git workflow.
 
-## Status — v5.0
+## Version history
 
-v5.0 is a rewrite of the storage and scanning layer. It is **pushed to the live project
-and byte-verified against it, but not yet exercised against a real Drive folder.** Run it
-on a small test folder before pointing it at anything that matters.
+Oldest first; the current release is the last entry. **Where the code and the live job stand
+right now is [STATUS.md](STATUS.md), not this section** — everything below is the record of
+how each version got here.
+
+### v5.0 — sheet-backed checkpoint
+
+A rewrite of the storage and scanning layer. At the time of writing it was pushed to the live
+project and byte-verified against it, but not yet exercised against a real Drive folder.
 
 What changed from v4.1:
 
@@ -461,8 +478,9 @@ show `Error: …` and can be retried by the owner). See
   at a time, since they contend for the same lock. It requires an explicit confirmation every
   time it is enabled, and removes its own trigger when no row is left pending.
 - **Hard guards on what may be trashed**, in `trashOneRow`, applying to both the dialog and the
-  background runner: the row must be present in the sheet (re-read every batch — never cached,
-  so deleting a row is final), have an empty Status, carry a hash and a well-formed file ID,
+  background runner: the row must be present in the sheet (re-read at the start of every chunk
+  — never cached, so deleting a row is final), have an empty Status, carry a hash and a
+  well-formed file ID,
   and — new — **its original must still be alive**. A duplicate whose keeper is already in the
   trash is `Skipped:`, not trashed, because trashing it could leave a set of identical files
   with no live copy. That costs one Drive read per family, cached per execution, and is
@@ -488,9 +506,34 @@ deleting them.
   Scanned So Far** confirms when no scan is in progress — spelling out that deleted rows will
   come back. A partial scan still compares without a prompt.
 
+**v5.10** — reset gives the cells back, and says what to save first.
+
+Ending one job and starting the next used to leave a mess that only showed up much later.
+Three fixes:
+
+- **Clearing a sheet now reclaims its cells.** Sheets charges the whole *grid*, not the
+  populated part, so `_scan_files` grown to 315 k rows kept costing 315 k rows' worth of the
+  workbook's 10-million-cell budget even when empty — and that budget is what stopped the big
+  scan dead mid-run. v5.0 did delete the rows; v5.0.1 swapped in `clearContent` to escape
+  *"Sorry, it is not possible to delete all non-frozen rows"*, and the cell cost of that trade
+  only became visible at 315 k rows. `purgeSheet` now clears **and** deletes the rows — bottom-up
+  in 50 k chunks, always leaving row 2 standing so the old error cannot come back, and bounded by
+  the slice deadline so a huge sheet cannot blow the 6-minute limit. Used by *Reset Scan
+  Progress* and at the start of a fresh scan; the compare path still uses plain `clearContent`,
+  because a structural delete on every compare would slow the tool's tightest execution.
+- **Reset asks first, and stops background jobs.** It is the one action that destroys the audit
+  trail, so it now confirms, naming the row count and linking the backup file — and it removes
+  any installed trigger, which it previously left firing.
+- **The dialog says to back the list up.** A standing reminder appears as soon as a duplicate
+  list exists, and again when a trash run finishes: copy the **Duplicates** tab to the separate
+  *Duplicate backup* spreadsheet. Separate, because a backup tab in this workbook would cost its
+  own full grid against the same limit.
+
 > **Don't hand-edit the checkpoint sheets.** `QUEUE_CURSOR` is a positional index into
 > `_scan_queue`; deleting rows above it silently shifts the scan onto the wrong folders,
 > so a resumed scan can under-report duplicates. Use **🚀 Angel → Reset Scan Progress**.
+> Emptying them *between* jobs is fine — that is what Reset is for, and it now reclaims the
+> cells too.
 
 ## How it works (complete flow)
 
@@ -548,7 +591,7 @@ Why the exclusions above exist, in technical terms:
 | `src/appsscript.json` | Apps Script manifest (timezone Europe/Berlin, V8 runtime, Advanced Drive Service v3) |
 | `src/Code.js` | Server-side Apps Script logic |
 | `src/Progress.html` | Client-side dialog UI |
-| `test/simulate.js` | Test harness — runs `src/Code.js` against a fake Sheets/Drive API. `node test/simulate.js`, 123 assertions, non-zero exit on failure. Never pushed to Apps Script |
+| `test/simulate.js` | Test harness — runs `src/Code.js` against a fake Sheets/Drive API. `node test/simulate.js`, 137 assertions, non-zero exit on failure. Never pushed to Apps Script |
 | `STATUS.md` / `HANDOFF.md` | Where things stand, and what the next session needs to know |
 | `.clasp.json` | clasp config — `scriptId` + `rootDir: src` |
 | `.claspignore` | Restricts pushes to the three source files |

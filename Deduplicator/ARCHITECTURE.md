@@ -314,7 +314,7 @@ flowchart TD
   LEFT -->|yes| TRASH
   LEFT -->|no| END(["Done — Status column is the audit trail"])
 
-  WHAT -->|"Reset Scan Progress"| RESET["CLEARS all three sheets,<br/>properties and cache"]
+  WHAT -->|"Reset Scan Progress"| RESET["confirms first, then DELETES the rows of<br/>all three sheets (reclaiming cells),<br/>properties, cache and any trigger"]
   RESET --> OPEN
 ```
 
@@ -332,7 +332,7 @@ flowchart TD
 | **Pause Scanning / Pause Trashing** | `requestPause` (cache) / client `stopping` flag | Nothing beyond the current batch's checkpoint | None | Yes — resume with the same button |
 | **Move Duplicates to Trash** | `trashDuplicates` → `trashOneRow` | `Status` per row, batched 50 | **Trashes files** | Only via Drive Trash |
 | **Trash in the Background** | `setBackgroundTrash` → `backgroundTrashTick` | Installs a trigger; then as above | **Trashes files, unattended** | Only via Drive Trash. Needs confirming on every enable |
-| **Reset Scan Progress** | `resetToken` | Clears all three sheets + all properties + cache | None | **No** — the scan and the audit trail are gone |
+| **Reset Scan Progress** | `resetToken` → `purgeSheet` | Confirms first, then **deletes the rows** of all three sheets (reclaiming their cells) + all properties + cache + any installed trigger | None | **No** — the scan and the audit trail are gone. The prompt names the backup file |
 
 Two properties of this pipeline are worth stating explicitly, because they are what make the
 tool safe to interrupt at any point:
@@ -356,7 +356,7 @@ two things that can do that, and they are interchangeable because **neither hold
 | Cadence | Immediately after each reply (3 s gap) | Every `BG_EVERY_MINUTES` = 5 min |
 | Duty cycle | ~100 % while open | ~90 % (4.5 min of work per 5 min) |
 | Runtime budget | The account's own daily quota | Additionally capped at `BG_DAILY_BUDGET_MS` = 5 h/day |
-| Stops when | Paused, the tab closes, or the job finishes | The job finishes, a pause is requested, or the daily cap is hit |
+| Stops when | Paused, the tab closes, or the job finishes | The job finishes, or a pause is requested. The daily cap only *pauses* it: ticks keep firing and return immediately until the day rolls over |
 
 There are **two** trigger handlers, deliberately separate and mutually exclusive:
 
@@ -386,8 +386,11 @@ reviewed, and the runner is only executing it.
 
 `trashOneRow` is the single gate, used by both schedulers. A row is acted on only if it:
 
-1. **is present in the Duplicates sheet** — re-read from the sheet on every batch, never
-   cached in properties, so a row the reviewer deletes is gone for good and is never trashed;
+1. **is present in the Duplicates sheet** — re-read from the sheet at the start of every
+   chunk, never cached in properties, so a row the reviewer deletes is gone for good and is
+   never trashed. Precisely: each execution snapshots the rows once and works from that
+   snapshot, so a row deleted *while a chunk is in flight* takes effect from the next chunk
+   (≤ 4.5 min) rather than instantly. Deleting while nothing is running is immediate;
 2. **has an empty Status** — nothing is trashed twice;
 3. **carries a hash and a well-formed file ID** (`looksLikeFileId`: URL-safe characters only,
    so a filename or a stray sentence in the wrong column is refused, not obeyed) — i.e. the row
@@ -472,6 +475,7 @@ Two caveats:
 | `TRASH_FLUSH` | 50 rows | Status was one `setValue` per row; that single-cell write was the bottleneck that made 1 600 rows take several executions |
 | `LINK_CHUNK` | 500 rows | Rich-text payload per write |
 | `READ_PAGE_ROWS` | 50 000 | Caps peak memory when streaming a large sheet |
+| `COMPACT_CHUNK` | 50 000 | Rows per `deleteRows` call when reclaiming a grid; a single 300 k-row structural delete is one very slow call |
 | `LOCK_WAIT` | 20 s | Absorbs contention between consecutive slices of the same job without a client round trip |
 | `BG_EVERY_MINUTES` | 5 | Trigger cadence; one minute more than a slice, so firings do not overlap |
 | `BG_DAILY_BUDGET_MS` | 5 h | Self-imposed share of the ~6 h/day trigger pool, leaving ~1 h for other scripts |
@@ -600,9 +604,27 @@ which reclaims ~6–7 M cells without touching any data and moves the ceiling to
 is a manual, one-off operation — the script never trims a grid itself, and deliberately so:
 narrowing a sheet is destructive if the layout is ever wrong about which columns matter.
 
-Two corollaries: the quota is per-*spreadsheet*, so checkpoint sheets and the reviewable result
-compete for one budget (reviewer-added helper columns included); and **a duplicated backup tab
-costs its own full grid**, so exporting to CSV is the cheaper way to keep a copy.
+Three corollaries. The quota is per-*spreadsheet*, so checkpoint sheets and the reviewable
+result compete for one budget (reviewer-added helper columns included). **A backup kept as a
+tab in this workbook costs its own full grid** — copy the sheet to a *different* spreadsheet
+(or a CSV) and the cells are charged to that file's budget instead of this one's.
+
+And the third, which was a live defect until v5.10: **clearing is not reclaiming.** `clearData`
+uses `clearContent`, which blanks cells but leaves the grid at its grown size, so a workbook
+that reached 315 k rows would start the *next* job with those cells still charged. The original
+v5.0 code did delete the rows; v5.0.1 replaced that with `clearContent` to escape *"Sorry, it is
+not possible to delete all non-frozen rows"* (which Sheets throws when asked to remove every
+non-frozen row), and the cell cost of that trade only became visible at 315 k rows. `purgeSheet`
+now does both — clear, then delete the rows bottom-up in `COMPACT_CHUNK` blocks, always leaving
+row 2 standing so the old error cannot recur. It is used where a job ends and the next begins
+(`resetToken`, `startFreshScan`, `seedQueue`) and deliberately **not** by `runDeduplication`,
+which clears the Duplicates sheet on every compare: a structural delete there would add cost to
+the tightest execution in the tool and shift conditional formats and validation ranges with it.
+
+The clear-then-compact order is load-bearing. Compaction is bounded by the slice deadline, so it
+can be cut short; clearing first means the worst outcome is an empty sheet with a larger grid
+than it needs. The reverse order could leave the previous job's records for the next scan to
+append to, which is a correctness bug rather than an untidy one.
 
 ### 7.4 Platform quotas — the constraint people forget
 
@@ -647,7 +669,7 @@ contend for the same lock and checkpoint.
 | Invariant | Mechanism |
 |---|---|
 | **Every content group keeps at least one copy** | n copies produce n−1 rows, so at most n−1 distinct files can ever be trashed — *regardless* of how the reviewer swaps rows. Reinforced at the point of deletion by rule 4 of `trashOneRow`, which refuses a duplicate whose original is already in the trash |
-| **A row deleted from the sheet is never trashed** | The list is re-read from the sheet on every batch and never cached, so deletion takes effect immediately and permanently |
+| **A row deleted from the sheet is never trashed** | The list is re-read from the sheet at the start of every chunk and never cached, so a row deleted while nothing is running is gone permanently. A row deleted *during* a chunk is still covered by that chunk's snapshot and drops out at the next one |
 | **Only rows this tool wrote can trigger a deletion** | `trashOneRow` requires a hash and a URL-safe file ID; hand-typed or mis-pasted rows are refused as `Error:` |
 | Compare is idempotent | Rebuilding the list yields the same rows; `Status` carries over by file ID, reviewer swaps carry over by unordered pair key |
 | No work is lost to a failure | Every slice checkpoints before exiting; every failure is returned as `{error, resumable}` rather than thrown at the client |
@@ -674,7 +696,7 @@ contend for the same lock and checkpoint.
 | Store | Holds | Why not one of the others |
 |---|---|---|
 | Sheets | Bulk records (N + F + D rows) | Only store with the capacity, append semantics, *and* human reviewability |
-| `ScriptProperties` | 5 small cursors | Durable across executions; 9 KB/value makes it useless for bulk |
+| `ScriptProperties` | 5 small cursors, plus the background runner's 2-key daily ledger | Durable across executions; 9 KB/value makes it useless for bulk |
 | `CacheService` | Live status, pause request | **The property store is read into an execution once**, so a running scan cannot reliably observe a flag another execution just set. Cache reads cross that boundary — which is exactly what "pause the scan from a button click" requires |
 | `LockService` | Mutual exclusion | Scan, compare and trash all rewrite the same sheets; the lock serialises them, and contention is reported as `busy` (retryable) rather than as failure |
 
@@ -694,6 +716,8 @@ blip without a human deciding anything.
 | BFS advance, checkpointing | `scanUntilDeadline`, `seedQueue`, `restartWalkIfRecordsLost` |
 | Hash bucketing, keeper choice | `runDeduplication`, `pickKeeper` |
 | Streaming a large sheet | `forEachDataRow` |
+| Clearing vs. reclaiming cells | `clearData` (blank), `purgeSheet` / `compactData` (blank **and** delete the rows) |
+| Throwing a job away | `resetToken` — confirmation, purge, trigger removal |
 | Resumable cosmetics | `decorateRows`, `finishPendingLinks`, `lastDuplicateRow`, `linkRuns` |
 | Unattended scheduling | `setBackgroundScan`, `backgroundScanTick`, `setBackgroundTrash`, `backgroundTrashTick`, `bgBudget`, `bgSpend`, `removeTriggers`, `triggerExists`, `backgroundInfo` |
 | Irreversible stage | `trashDuplicates`, and its per-row gate `trashOneRow` / `looksLikeFileId` / `isFileAlive` |
@@ -711,7 +735,7 @@ The logic is exercised against a **fake Sheets/Drive API** (an in-memory sheet m
 ranges, rich text, checkboxes, filters and selections, plus a fake trigger registry) so that
 column layouts, the keeper rule, swap semantics, repeat collapsing, status carry-over, layout
 migration, deferred decoration and both background runners' lifecycles are all asserted without
-touching a real spreadsheet — currently 123 assertions.
+touching a real spreadsheet — currently 137 assertions.
 
 Notable among them, because they encode promises rather than mechanics: a repeated file record
 is never reported as a duplicate of itself; a swap of every row in a family over-keeps instead

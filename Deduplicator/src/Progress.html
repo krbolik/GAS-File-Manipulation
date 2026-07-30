@@ -18,6 +18,8 @@
     #results { min-height: 100px; max-height: 200px; overflow-y: auto; margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; }
     .note { color: #666; font-size: 11px; }
     .err { color: #c1121f; }
+    .backup { margin-top: 12px; padding: 10px 12px; background: #fff8e6; border: 1px solid #ffd88a;
+              border-radius: 8px; font-size: 11px; line-height: 1.45; color: #4a3b12; }
   </style>
 </head>
 <body>
@@ -41,6 +43,7 @@
     </div>
 
     <div id="results"></div>
+    <div id="backupNote" class="backup" style="display:none"></div>
     <button id="delBtn" class="btn danger" style="display:none" onclick="trashAction()">Move Duplicates to Trash</button>
   </div>
 
@@ -59,6 +62,15 @@
     // the script lock for at most the 6-minute limit, and 20 x 20s comfortably outlasts it.
     const MAX_BUSY_WAITS = 20;
     const BUSY_DELAY = 20000;
+
+    // Where the reviewer's copy of the Duplicates sheet belongs. A separate spreadsheet,
+    // not a tab in this one: Sheets charges a tab's whole grid against the 10-million-cell
+    // limit of the workbook holding it, and this workbook has already hit that ceiling.
+    const BACKUP_NAME = 'Duplicate backup';
+    const BACKUP_URL = 'https://docs.google.com/spreadsheets/d/1oBnLcYpUcXKo2V25rPn9MSSJGPhbJZVwy6MGpmKyUds/edit';
+    const BACKUP_HOW = 'right-click the <b>Duplicates</b> tab → <b>Copy to</b> → ' +
+                       '<b>Existing spreadsheet</b> → <a href="' + BACKUP_URL +
+                       '" target="_blank"><b>' + BACKUP_NAME + '</b></a>';
 
     let pollInterval = null;
     let scanUrl = '';
@@ -137,6 +149,7 @@
       }
 
       paintBackground();
+      paintBackup();
 
       if (state.dupePending) {
         del.style.display = 'block';
@@ -153,6 +166,26 @@
       } else {
         del.style.display = 'none';
       }
+    }
+
+    /**
+     * Standing reminder, shown from the moment a duplicate list exists.
+     *
+     * The Status column is the only record of what has been trashed — Drive itself will not
+     * tell you which of two identical files went into the bin on purpose — and *Reset Scan
+     * Progress* deletes it. The copy has to live in a different spreadsheet: a duplicated tab
+     * in this workbook costs its own full grid against the 10-million-cell limit this
+     * spreadsheet has already hit once.
+     */
+    function paintBackup() {
+      const el = document.getElementById('backupNote');
+      if (!state.dupeTotal) { el.style.display = 'none'; return; }
+      el.style.display = 'block';
+      el.innerHTML = '📋 <b>Keep a copy of the Duplicates tab:</b> ' + BACKUP_HOW + '.<br>' +
+        'Its <b>Status</b> column is the only record of what was trashed, and ' +
+        '<b>🚀 Angel → Reset Scan Progress</b> throws it away. Copy it to that file rather ' +
+        'than to a tab in this one — a tab here costs its own cells against this ' +
+        'spreadsheet’s limit.';
     }
 
     /*
@@ -622,8 +655,12 @@
           setTimeout(runTrash, 2000);
           return;
         }
+        // The run is over, so this is the moment the audit trail matters most and the moment
+        // a reset is most likely to be reached for. Say it here as well as in the note above.
         endTrash('<b>Done.</b> ' + window.trashedTotal + ' file(s) trashed' + tail +
-                 (window.errorTotal || window.skippedTotal ? ' — see the Status column in the Duplicates sheet.' : '.'));
+                 (window.errorTotal || window.skippedTotal ? ' — see the Status column in the Duplicates sheet.' : '.') +
+                 '<br><br><b>Back the list up now:</b> ' + BACKUP_HOW + '. The Status column is ' +
+                 'the only record of what was trashed, and it does not survive a reset.');
       }).withFailureHandler(handleTrashFailure).trashDuplicates();
     }
 

@@ -1,7 +1,7 @@
 # Deduplicator — Status
 
-**As of 2026-07-28. Code version v5.9 (`863c819`), pushed to the live Apps Script project and
-byte-verified with `clasp pull`. Working tree clean; local, remote and live project agree.**
+**As of 2026-07-30. Code version v5.10. The 800 GB job's trash run has been reported complete;
+what remains is confirming it and closing the job out.**
 
 ---
 
@@ -9,11 +9,12 @@ byte-verified with `clasp pull`. Working tree clean; local, remote and live proj
 
 | | |
 |---|---|
-| Version | **v5.9** |
-| Live project | In sync — `clasp push` + `clasp pull` byte-check after every change this session |
-| Repo | `main`, clean, pushed to `origin` |
-| Verification | 123 assertions against a fake Sheets/Drive API — **all passing, but the harness is not in the repo** (see HANDOFF) |
-| Untested in production | Background trashing (v5.8) and the compare-button retirement (v5.9) have not yet been exercised on the live sheet |
+| Version | **v5.10** |
+| Live project | In sync — `clasp push` + `clasp pull` byte-check after every change |
+| Repo | `main` |
+| Verification | **137 assertions, all passing.** The harness is in the repo at [`test/simulate.js`](test/simulate.js); run `node test/simulate.js`, which exits non-zero if anything fails. It runs the real `src/Code.js` against a fake Sheets/Drive/Script API and is never pushed to Apps Script — `.claspignore` limits pushes to `src/` |
+| Exercised in production | Everything through v5.8, including background trashing, on the run below. v5.9 (the compare button retiring itself) and v5.10 (reset reclaiming cells, the backup reminders) are asserted by the harness but have not yet been watched on the live sheet |
+| Backup file | [Duplicate backup](https://docs.google.com/spreadsheets/d/1oBnLcYpUcXKo2V25rPn9MSSJGPhbJZVwy6MGpmKyUds/edit) — where a copy of the `Duplicates` tab belongs, and what the dialog and the reset prompt now point at |
 
 ## The live job (DuplicateFinder / the 800 GB tree)
 
@@ -23,25 +24,43 @@ Folder: `1uxLwAGVB94mzZlM-g7G3pjfk-FLYBVa1` · Sheet: `1DZuoYcTXyTV35llQlO3qmTK6
 | | |
 |---|---|
 | `_scan_files` | ~315,041 records |
-| Walk | **Reported complete** — the last analysis found no phase marker and no installed trigger, i.e. `processFolder` finished the walk, ran the comparison itself and deleted the phase. **Verify from the dialog before acting**: *Analyze Folder* = complete, *Resume Scan* = not |
-| `Duplicates` | 72,308 rows, all pending when the run began |
-| **Trashing** | **Started 2026-07-28 and reported working.** Not confirmed finished — validate with the procedure below |
-| Trashed earlier | ~2,508 files, before the list was rebuilt. **Those Status marks no longer exist** — see below |
+| Walk | **Complete** — no phase marker, no installed trigger: `processFolder` finished the walk, ran the comparison itself and deleted the phase |
+| `Duplicates` | 72,308 rows when the list was built — **then every row whose file was under 60 KB was deleted by hand**, roughly halving the work |
+| **Trashing** | **Run and reported complete.** Confirm with the checklist below |
+| Trashed earlier | ~2,508 files, before the list was rebuilt. Those Status marks no longer exist — see below |
 | Daily budget | Shared 5 h ledger, day rolling at midnight US Pacific |
 
-### Two live conditions the next session must respect
+### The size cut, and what it means
+
+The sub-60 KB rows were **deleted from the sheet**, not trashed and not excluded from the scan.
+Consequences, all of them deliberate:
+
+- Those duplicate files **are still in Drive**, and are still recorded in `_scan_files`. Nothing
+  was lost; that work simply was not done.
+- **The row count no longer matches the 72,308 above.** Every count below reconciles against
+  whatever the sheet holds today.
+- **A rebuild would bring them all back**, with an empty Status — i.e. queued for trashing,
+  which is the opposite of the intent behind deleting them. So, until this job is deliberately
+  finished with: no *Compare Files Scanned So Far*, no *Analyze Folder* on the same URL, and no
+  background scan trigger. The dialog already hides its compare button; the menu asks first.
+- **The `Duplicates` sheet is the only record of what was trashed.** Copy it into the
+  [Duplicate backup](https://docs.google.com/spreadsheets/d/1oBnLcYpUcXKo2V25rPn9MSSJGPhbJZVwy6MGpmKyUds/edit)
+  file before anything else — right-click the tab → **Copy to** → **Existing spreadsheet**. It
+  has to be that separate file, not a tab here: a tab in this workbook costs its own full
+  26-column grid against the 10 M cell ceiling this spreadsheet has already hit once.
+
+### Two conditions that still shape what is safe to do
 
 **1. The 2,508 trash marks and all manual Swap decisions were lost.** A header migration fired
 from a non-compare code path (`trashDuplicates` / `finishPendingLinks` call `getSheet`, which
 re-heads and clears a mismatched sheet) and dropped the rows. Only `runDeduplication` snapshots
 Status and swaps before that happens, so those were not preserved.
 
-Consequence: for any family where the reviewer had swapped, the rebuilt list applies the date
-rule again and nominates the copy that was *already trashed* as the keeper — which would have
-put the surviving copy up for trashing. **This is now blocked in code** (v5.8, `trashOneRow`
-rule 4): a duplicate whose original is already in the trash is marked
-`Skipped: the original is already in the trash` instead. Expect a number of those rows on the
-first trash run; they are the fingerprint of the lost swaps, not a fault.
+Consequence: for any family where the reviewer had swapped, the rebuilt list applied the date
+rule again and nominated the copy that was *already trashed* as the keeper — which would have
+put the surviving copy up for trashing. **This is blocked in code** (v5.8, `trashOneRow` rule
+4): such a row is marked `Skipped: the original is already in the trash` instead. The
+`Skipped:` rows on the sheet are the fingerprint of those lost swaps, not a fault.
 
 The user holds a 37 k-era backup of the sheet that still contains the swap signatures (rows
 where `Duplicate Date` is newer than `Original Date`).
@@ -49,23 +68,27 @@ where `Duplicate Date` is newer than `Original Date`).
 **2. The workbook hit the 10 M cell limit and was manually trimmed.** Sheets charges the whole
 grid width, so 315 k rows × 26 default columns ≈ 8.2 M cells. Every append failed with *"This
 action would increase the number of cells…"*, which looks like "the scan stopped recording".
-The fix was deleting unused columns (`_scan_files` → A–F, `_scan_queue` → A–B). **Confirm the
-trim survived** (`_scan_files`, `Cmd+→`, last column should be F). At this document size Sheets
-also throws intermittent *"Service Spreadsheets failed while accessing document"* — transient,
-retried, and expected rather than alarming.
+The fix was deleting unused columns (`_scan_files` → A–F, `_scan_queue` → A–B). **The trim was
+confirmed still in place on 2026-07-30.** Re-check it after any manual work on those sheets:
+`_scan_files`, `Cmd+→`, last column should be F. At this document size Sheets also throws
+intermittent *"Service Spreadsheets failed while accessing document"* — transient, retried, and
+expected rather than alarming.
 
-## Validating the trash run
+## Closing out the 800 GB job
 
-Written to be usable with no memory of the session that started the run. Column letters are
-the v5.6+ layout: **K** = `Duplicate ID`, **L** = `Hash`, **M** = `Status`, **B** / **F** = the
-duplicate's and the original's links, **J** = `Copies`.
+Written to be usable with no memory of the session that ran it. Column letters are the v5.6+
+layout: **I** = `Size`, **J** = `Copies`, **K** = `Duplicate ID`, **L** = `Hash`, **M** =
+`Status`, **B** / **F** = the duplicate's and the original's links.
 
-### 1. The four counts must add up
+**Deadline:** trashed files are recoverable from Drive Trash for 30 days. Everything here is
+cheap; do it inside that window, and do not empty the trash until satisfied.
+
+### 1. The counts must add up
 
 Paste into any empty cells to the right of column N of the **Duplicates** sheet:
 
 ```
-=COUNTIF(K2:K,"<>")                       ' rows in the list
+=COUNTIF(K2:K,"<>")                       ' rows in the list (NOT 72,308 — the small ones were deleted)
 =COUNTIF(M2:M,"Trashed")                  ' done
 =COUNTIFS(K2:K,"<>",M2:M,"")              ' still pending
 =COUNTIF(M2:M,"Error*")                   ' attempted and failed
@@ -77,7 +100,21 @@ cell holds something unexpected — sort by column M and look at the odd values.
 means the run finished**; a non-zero pending count with nothing running means it stopped early,
 and clicking the trash button again resumes safely.
 
-### 2. What each outcome means
+### 2. Confirm the size cut did what was intended
+
+```
+=MIN(I2:I)                                ' smallest file still listed
+=COUNTIFS(I2:I,"<61440")                  ' rows under 60 KiB that survived the deletion
+=COUNTIFS(I2:I,"<60000")                  ' same, if the filter used 60,000 bytes
+=SUMIFS(I2:I,M2:M,"Trashed")              ' bytes reclaimed
+```
+
+The two counts should be 0. Anything above zero means a small file was trashed after all —
+harmless, but it means the cut was not clean and the "50 % of the effort" figure is off. The
+reclaimed-bytes figure is the job's headline number, but the space is not actually freed until
+Drive Trash is emptied.
+
+### 3. What each outcome means
 
 | Status | Meaning | Action |
 |---|---|---|
@@ -86,7 +123,7 @@ and clicking the trash button again resumes safely.
 | `Skipped: the original is already in the trash` | The guard refused, because trashing this copy could have left a set of identical files with **no live copy**. Expected here, as the fingerprint of the swap decisions lost earlier | Review each: tick **Swap ⇄** to flip the sides and retry, or leave it |
 | `Error: …` | Attempted and failed — usually "not yours to delete" if run by a non-owner | Re-run as `kai.bolik@createk.biz`; the message says which |
 
-### 3. Cross-check against Drive, not just the sheet
+### 4. Cross-check against Drive, not just the sheet
 
 The sheet records what the script *believes*. Confirm independently:
 
@@ -101,8 +138,10 @@ The sheet records what the script *believes*. Confirm independently:
   reading `Dedup trash chunk done {"trashed":…,"errors":…,"skipped":…,"remaining":…}`. The
   `remaining` of the final line should be 0. `Dedup background trash complete` means the
   trigger removed itself, i.e. the list was fully worked through.
+- **No trigger is still installed**: the dialog shows background scanning and trashing off, or
+  check Apps Script → Triggers directly. Both runners remove their own trigger when done.
 
-### 4. The invariant worth confirming by hand
+### 5. The invariant worth confirming by hand
 
 **No set of identical files should have lost every copy.** The code enforces this at two levels
 (*n* copies yield only *n−1* rows, and the keeper check refuses a duplicate whose original is
@@ -110,16 +149,39 @@ already trashed), but it is cheap to sample: filter for `Copies > 2`, pick a few
 column L, and confirm that each family's column-F original opens a live file. Anything else
 means a real bug, and is worth reporting before further trashing.
 
-## What is left to do on the job
+### 6. Optional: a verification re-scan
 
-1. **Confirm the trash run completed** using the procedure above. It needs roughly 7 h of
-   runtime plus the keeper checks, i.e. two to three days at 5 h/day, so expect it to span
-   several sessions. It must run as `kai.bolik@createk.biz` — only the owner can trash files in
-   their own My Drive.
-2. **Work through the `Skipped:` rows** — each is a decision the tool deliberately refused to
-   make.
-3. Decide whether anything remains to scan (the walk reports complete; a fresh verification scan
-   after trashing is the only way to be sure).
+The only way to *prove* nothing was missed is to scan the tree again and see near-zero
+duplicates at 60 KB and above. It costs hours and **rebuilds the `Duplicates` sheet**,
+destroying the audit trail — so make the backup copy first, and only bother if the spot checks
+above raise a doubt. The walk already reports complete.
+
+## Starting the next deduplication job
+
+Three steps, on the same spreadsheet. **v5.10 removed the manual cleanup that used to be
+needed here** — no hand-deleting of rows, no separate trigger check.
+
+1. **Copy the `Duplicates` tab to the
+   [Duplicate backup](https://docs.google.com/spreadsheets/d/1oBnLcYpUcXKo2V25rPn9MSSJGPhbJZVwy6MGpmKyUds/edit)
+   file** — right-click the tab → **Copy to** → **Existing spreadsheet**. Once the next scan
+   starts, the record of this job is gone. The dialog and the reset prompt both remind you.
+2. **🚀 Angel → Reset Scan Progress**, and answer Yes. It now does the whole job in one action:
+   deletes the rows of all three sheets (**reclaiming their cells**, which mattered enough to be
+   a manual step before v5.10), clears every cursor and the cache, and removes any background
+   trigger still installed. If it reports that empty rows remain, run it again — a 315 k-row
+   grid can take more than one execution to delete, and no data is left in it either way.
+3. **Analyze Folder** with the new URL, then optionally **Run in the Background** and close
+   everything. Review, **Swap ⇄** where the other copy should win, delete rows to exclude them,
+   and trash — from the dialog, or **Trash N in the Background** for a long list.
+
+Worth a glance rather than a step: that the column trim is still in place (§2 above,
+`_scan_files` A–F, `_scan_queue` A–B — confirmed 2026-07-30), since nothing in the script
+narrows a grid on its own.
+
+Two things worth deciding *before* you start reviewing rather than during it: whether to exclude
+small files (deleting the rows works, but a rebuild brings them back — deciding it once, up
+front, is cheaper), and whether the account running the trash owns the files, since only an
+owner can trash their own My Drive files.
 
 ## Known defects, not yet fixed
 

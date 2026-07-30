@@ -23,7 +23,10 @@ const path = require('path');
 const SRC = path.join(__dirname, '..', 'src', 'Code.js');
 
 class Sheet {
-  constructor(name) { this.name = name; this.cells = []; this.notes = {}; this.checkboxRows = new Set(); this.links = {}; this.maxCols = 26; this.filterHidden = new Set(); this.selection = []; }
+  // maxRows is modelled for real, not derived from the data: the whole point of compaction
+  // is that Sheets charges the grid rather than the populated cells, so a fake that reported
+  // "as many rows as there is data" could not tell a cleared sheet from a compacted one.
+  constructor(name) { this.name = name; this.cells = []; this.notes = {}; this.checkboxRows = new Set(); this.links = {}; this.maxCols = 26; this.maxRows = 1000; this.filterHidden = new Set(); this.selection = []; }
   getName() { return this.name; }
   isRowHiddenByFilter(row) { return this.filterHidden.has(row); }
   isRowHiddenByUser() { return false; }
@@ -34,8 +37,9 @@ class Sheet {
   setFrozenRows() { return this; }
   getMaxColumns() { return this.maxCols; }
   insertColumnsAfter(after, n) { this.maxCols += n; }
-  getMaxRows() { return Math.max(this.cells.length, 1000); }
-  insertRowsAfter() {}
+  getMaxRows() { return this.maxRows; }
+  insertRowsAfter(after, n) { this.maxRows += n; }
+  deleteRows(row, n) { this.cells.splice(row - 1, n); this.maxRows -= n; }
   setColumnWidth() { return this; }
   getLastRow() {
     let last = 0;
@@ -167,7 +171,7 @@ const trashed = [];
 sandbox.trashed = trashed;
 
 vm.createContext(sandbox);
-new vm.Script(fs.readFileSync(SRC, 'utf8') + '\n;this.__api = {runDeduplication, swapKeeper, swapSelectedRows, selectedDataRows, onEdit, getState, trashDuplicates, finishPendingLinks, setBackgroundScan, backgroundScanTick, backgroundInfo, bgBudget, requestPause, setBackgroundTrash, backgroundTrashTick, pendingTrashCount, trashOneRow, looksLikeFileId, BG_TRASH_FN, compareScannedSoFarMenu, BG_DAILY_BUDGET_MS, BG_TRIGGER_FN, DUPES_HEADERS, D_COL_SWAP, D_COL_STATUS, D_COL_DUPE_ID};').runInContext(sandbox);
+new vm.Script(fs.readFileSync(SRC, 'utf8') + '\n;this.__api = {runDeduplication, swapKeeper, swapSelectedRows, selectedDataRows, onEdit, getState, trashDuplicates, finishPendingLinks, setBackgroundScan, backgroundScanTick, backgroundInfo, bgBudget, requestPause, setBackgroundTrash, backgroundTrashTick, pendingTrashCount, trashOneRow, looksLikeFileId, BG_TRASH_FN, compareScannedSoFarMenu, BG_DAILY_BUDGET_MS, BG_TRIGGER_FN, DUPES_HEADERS, D_COL_SWAP, D_COL_STATUS, D_COL_DUPE_ID, resetToken, startFreshScan, purgeSheet, compactData};').runInContext(sandbox);
 const api = sandbox.__api;
 
 /* ---- fixture: A,B,C identical (B newest); D,E identical (D newest, scanned first);
@@ -605,6 +609,55 @@ api.compareScannedSoFarMenu();
 ok.push(['a partial scan compares without a prompt', !/Rebuild the duplicate list/.test(alerts.join(' '))]);
 delete props['PHASE'];
 uiAnswer = 'YES';
+
+/* ---- Reset: asks first, stops background jobs, and gives the cells back ---- */
+console.log('\nreset:');
+triggers.length = 0;
+Object.keys(props).forEach(k => delete props[k]);
+delete ss.sheets['Duplicates'];
+api.runDeduplication();
+const rDupes = ss.getSheetByName('Duplicates');
+const rFiles = ss.getSheetByName('_scan_files');
+const gridBefore = rFiles.getMaxRows();
+
+props['PHASE'] = 'SCAN';
+api.setBackgroundScan(true);                     // a background job is running meanwhile
+alerts.length = 0;
+uiAnswer = 'NO';
+api.resetToken();
+console.log('  prompt:', (alerts[0] || '').replace(/\n/g, ' | ').slice(0, 150));
+ok.push(['reset asks before throwing the list away', /Throw away the scan/.test(alerts.join(' '))]);
+ok.push(['reset says where the backup belongs',
+  /Duplicate backup/.test(alerts.join(' ')) && /Copy to/.test(alerts.join(' '))]);
+ok.push(['answering No keeps the rows', rDupes.getLastRow() > 1]);
+ok.push(['answering No keeps the background job', triggers.length === 1]);
+
+uiAnswer = 'YES';
+alerts.length = 0;
+logs.length = 0;
+api.resetToken();
+console.log('  after reset:', logs.join(' | '));
+ok.push(['reset empties the sheets', rDupes.getLastRow() <= 1 && rFiles.getLastRow() <= 1]);
+ok.push(['reset shrinks the grid rather than only blanking it',
+  gridBefore > 2 && rDupes.getMaxRows() <= 2 && rFiles.getMaxRows() <= 2]);
+ok.push(['reset stops any background job', triggers.length === 0]);
+ok.push(['reset clears every cursor', !props['PHASE'] && !props['QUEUE_CURSOR'] && !props['BG_USED_MS']]);
+
+/* ---- a fresh scan must not inherit the previous job's records ---- */
+api.startFreshScan('rootX', Date.now() + 60 * 1000);
+ok.push(['a fresh scan starts from an empty file record', rFiles.getLastRow() <= 1]);
+ok.push(['and seeds the queue with just the root', ss.getSheetByName('_scan_queue').getLastRow() === 2]);
+
+/* ---- compaction is bounded by the deadline, and never at the data's expense ---- */
+const probe = ss.insertSheet('_compact_probe');
+probe.appendRow(['h']);
+probe.cell(500, 1, 'x');
+ok.push(['a compaction out of time reports it did not finish', api.compactData(probe, Date.now() - 1) === false]);
+ok.push(['rows survive a compaction that could not run', probe.getMaxRows() > 2]);
+ok.push(['but purge still clears the data first',
+  api.purgeSheet(probe, Date.now() - 1) === false && probe.getLastRow() <= 1]);
+ok.push(['and an unbounded compaction finishes the job',
+  api.compactData(probe) === true && probe.getMaxRows() <= 2]);
 
 console.log('\n--- checks ---');
 let bad = 0;

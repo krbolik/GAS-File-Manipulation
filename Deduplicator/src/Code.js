@@ -1,11 +1,17 @@
 /**
- * Tech Angel Deduplicator v5.4 (Sheet-backed, resumable, interruptible)
+ * Tech Angel Deduplicator v5.10 (Sheet-backed, resumable, interruptible)
  *
  * HOW TO USE:
  *   1. In the bound Google Sheet, open the "🚀 Angel" menu → "Start Deduplicator Dialog".
  *   2. Paste a Google Drive folder URL into the dialog and click "Analyze Folder".
- *   3. Wait for the scan (it auto-resumes if it hits the 6-min limit).
- *   4. Review the "Duplicates" sheet, then click "Move Duplicates to Trash".
+ *   3. Wait for the scan (it auto-resumes if it hits the 6-min limit). Optionally click
+ *      "Run in the Background" and the walk continues on Google's servers with the tab
+ *      closed and the machine off — capped at BG_DAILY_BUDGET_MS a day, and it never
+ *      trashes anything.
+ *   4. Review the "Duplicates" sheet: open the links, tick "Swap ⇄" on any row whose
+ *      other copy you would rather keep, delete rows you want left alone entirely.
+ *   5. Click "Move N Duplicates to Trash" — or "Trash N in the Background" for a list too
+ *      long to sit through, which asks for a confirmation every time it is switched on.
  *   To clear a paused/partial scan: "🚀 Angel" menu → "Reset Scan Progress".
  *
  * PARTIAL RESULTS: a scan does not have to finish to be useful. "Pause & Compare"
@@ -13,6 +19,13 @@
  * and fills the Duplicates sheet, so those duplicates can be trashed immediately;
  * "Resume Scan" picks the walk back up at the cursor. Re-comparing later keeps the
  * Status of rows already handled, so no trashing work is ever repeated or lost.
+ *
+ * WHAT MAY BE TRASHED: trashOneRow is the only gate, and it acts on a row only if the
+ * row is present in the Duplicates sheet (re-read at the start of every chunk, never
+ * cached, so a deleted row is gone for good), its Status is empty, it carries a hash
+ * and a URL-safe file id — i.e. this tool wrote it, not a human — and the original it
+ * names is still alive, so no set of identical files can end up with every copy in the
+ * trash. A rebuild of the list, on the other hand, brings deleted rows back.
  *
  * STORAGE: all bulk state lives in hidden sheets of this spreadsheet, never in
  * ScriptProperties (a single property value is capped at 9 KB — roughly 40 files —
@@ -88,6 +101,16 @@ const SWAP_NOTE = 'Tick this box to keep the file in this row instead: the Dupli
                   'that gets trashed. Tick again to swap back. Rows already trashed cannot ' +
                   'be swapped.';
 
+/**
+ * Where the reviewer's copy of the Duplicates sheet belongs. It has to be a *separate*
+ * spreadsheet: Sheets charges every cell of a tab's grid against the 10-million-cell
+ * limit of the workbook holding it, and this one has already hit that ceiling once, so a
+ * backup tab kept here would cost as much as the data it is backing up. Copied to another
+ * file, the cells are charged to that file's own budget instead.
+ */
+const BACKUP_NAME = 'Duplicate backup';
+const BACKUP_URL = 'https://docs.google.com/spreadsheets/d/1oBnLcYpUcXKo2V25rPn9MSSJGPhbJZVwy6MGpmKyUds/edit';
+
 const LINK_COL_WIDTH = 320;
 const LINK_CHUNK = 500;              // rich-text rows per write, keeps payloads small
 
@@ -96,6 +119,7 @@ const FLUSH_EVERY = 200;             // rows buffered before a batched sheet wri
 const STATUS_EVERY = 2000;           // ms between live-status writes
 const PAGE_SIZE = 1000;              // Drive list page size
 const TRASH_FLUSH = 50;              // Status cells written per batch while trashing
+const COMPACT_CHUNK = 50000;         // rows deleted per call when reclaiming the grid
 
 /**
  * Check the original is still alive before trashing its duplicate — one extra Drive read
@@ -764,15 +788,50 @@ function showUi() {
   SpreadsheetApp.getUi().showModelessDialog(html, 'Deduplication Engine');
 }
 
+/**
+ * Throws the whole job away: the three sheets, every cursor, the cache, and any background
+ * runner still installed. This is the one action in the tool that destroys the audit trail —
+ * the Status column is the only record of what has already been trashed — so it asks first
+ * and says where the copy belongs.
+ *
+ * It also *reclaims the cells*, which `clearData` alone does not: see purgeSheet.
+ */
 function resetToken() {
-  logIt('resetToken', 'clearing checkpoint sheets, properties and cache');
+  const ui = SpreadsheetApp.getUi();
+  const dupesSh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DUPES_SHEET);
+  const rows = dupesSh ? Math.max(0, dupesSh.getLastRow() - 1) : 0;
+
+  const answer = ui.alert(
+      'Throw away the scan and the duplicate list?',
+      (rows ? 'The "' + DUPES_SHEET + '" sheet holds ' + rows + ' row(s), and its Status column ' +
+              'is the only record of what has already been trashed.\n\nBack it up first: ' +
+              'right-click the "' + DUPES_SHEET + '" tab → Copy to → Existing spreadsheet → "' +
+              BACKUP_NAME + '"\n' + BACKUP_URL + '\n\n'
+            : '') +
+      'This clears all three sheets, every saved cursor and the cache, and stops any ' +
+      'background job. Nothing in Drive is touched, and nothing already trashed comes back ' +
+      'out of the bin.\n\nContinue?',
+      ui.ButtonSet.YES_NO);
+  if (answer !== ui.Button.YES) return ui.alert('Nothing was changed.');
+
+  logIt('resetToken', 'clearing checkpoint sheets, properties, triggers and cache');
+  const deadline = Date.now() + MAX_RUNTIME;
+  let compacted = true;
   [FILES_SHEET, QUEUE_SHEET, DUPES_SHEET].forEach(name => {
     const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
-    if (sh) clearData(sh);
+    if (sh && !purgeSheet(sh, deadline)) compacted = false;
   });
+  // A reset that left a trigger firing would be a reset in name only.
+  const stopped = removeTriggers(BG_TRIGGER_FN) + removeTriggers(BG_TRASH_FN);
   PropertiesService.getScriptProperties().deleteAllProperties();
   CacheService.getScriptCache().removeAll([K_STATUS, K_PAUSE]);
-  SpreadsheetApp.getUi().alert('Scan progress, checkpoint sheets and cache cleared.');
+
+  logIt('resetToken done', { backgroundJobsStopped: stopped, gridCompacted: compacted });
+  ui.alert('Scan progress, checkpoint sheets and cache cleared.' +
+           (stopped ? '\n\n' + stopped + ' background job(s) stopped.' : '') +
+           (compacted ? ''
+                      : '\n\nThe sheets still hold empty rows — run this again to finish giving ' +
+                        'the spreadsheet its cells back. No data is left in them either way.'));
 }
 
 /* --------------------------------------------------------------- resilience -- */
@@ -964,6 +1023,54 @@ function clearData(sh) {
   if (last > 1) sh.getRange(2, 1, last - 1, sh.getMaxColumns()).clearContent();
 }
 
+/**
+ * Empties a sheet *and* gives the spreadsheet its cells back — what to use when one job
+ * ends and the next begins.
+ *
+ * `clearData` only blanks cells. Sheets charges the whole **grid**, so a sheet grown to
+ * 315 k rows keeps costing 315 k × its width for ever after, which is how this workbook
+ * reached the 10 M ceiling and made every append fail. Deleting the rows is the only thing
+ * that reclaims them.
+ *
+ * The order is load-bearing: clearing first means the data is gone whatever happens next,
+ * so a compaction cut short by the deadline leaves an empty sheet with a bigger grid than
+ * it needs — untidy, never wrong. Compacting first and failing halfway would leave records
+ * of the previous job for the next scan to append to, which is a correctness bug.
+ *
+ * Deliberately *not* used by runDeduplication, which clears the Duplicates sheet on every
+ * compare: a structural delete there would add cost and risk to the tightest execution in
+ * the tool, and would shift conditional formats and validation ranges with it.
+ */
+function purgeSheet(sh, deadline) {
+  clearData(sh);
+  return compactData(sh, deadline);
+}
+
+/**
+ * Deletes every row below the header, bottom-up and in chunks. Returns false if the
+ * deadline cut it short, in which case the rows that remain are empty and the next call
+ * finishes the job.
+ *
+ * Two hazards. Sheets refuses to remove *all* non-frozen rows — "Sorry, it is not possible
+ * to delete all non-frozen rows", the v5.0.1 failure that made clearContent the default in
+ * the first place — so row 2 is always left standing. And a single 300 k-row structural
+ * delete is a slow call, so it is chunked rather than attempted in one go.
+ */
+function compactData(sh, deadline) {
+  deadline = deadline || (Date.now() + MAX_RUNTIME);
+  let max = sh.getMaxRows();
+  while (max > 2) {                                   // header + one spare row is the floor
+    if (Date.now() > deadline) {
+      logIt('compaction paused', { sheet: sh.getName(), rowsLeft: max });
+      return false;
+    }
+    const height = Math.min(COMPACT_CHUNK, max - 2);
+    withRetry(() => sh.deleteRows(max - height + 1, height));
+    max -= height;
+  }
+  return true;
+}
+
 function readColumns(sh, numCols) {
   const n = sh.getLastRow() - 1;
   if (n < 1) return [];
@@ -1032,7 +1139,7 @@ function processFolder(inputUrl, maxMs) {
       if (!rootId) {
         return { error: 'Please provide a valid Google Drive folder URL (e.g. https://drive.google.com/drive/folders/<id>).' };
       }
-      startFreshScan(rootId);
+      startFreshScan(rootId, deadline);
       phase = 'SCAN';
     } else if (phase === 'SCAN') {
       restartWalkIfRecordsLost();
@@ -1084,21 +1191,23 @@ function parseFolderId(inputUrl) {
   return id || null;
 }
 
-function startFreshScan(rootId) {
+function startFreshScan(rootId, deadline) {
   const filesSh = getSheet(FILES_SHEET, FILES_HEADERS);
   const dupesSh = getSheet(DUPES_SHEET, DUPES_HEADERS);
-  [filesSh, dupesSh].forEach(clearData);
-  const root = seedQueue(rootId);
+  // purgeSheet, not clearData: the previous job's rows stay charged against the workbook's
+  // 10M cells until they are actually deleted, and a new job is exactly when to reclaim them.
+  [filesSh, dupesSh].forEach(sh => purgeSheet(sh, deadline));
+  const root = seedQueue(rootId, deadline);
   PropertiesService.getScriptProperties().setProperty(P_PHASE, 'SCAN');
   statusState = {};
   setStatus({ currentParent: 'Root', currentFolder: root.name, currentFile: 'Starting…', files: 0 }, true);
 }
 
 /** Puts the walk back at the root: one queue entry, cursor 0, no page token. */
-function seedQueue(rootId) {
+function seedQueue(rootId, deadline) {
   const props = PropertiesService.getScriptProperties();
   const queueSh = getSheet(QUEUE_SHEET, QUEUE_HEADERS);
-  clearData(queueSh);
+  purgeSheet(queueSh, deadline);
   const root = withRetry(() =>
       Drive.Files.get(rootId, { fields: 'id,name', supportsAllDrives: true }));
   appendRows(queueSh, [[root.id, root.name]]);
@@ -1602,9 +1711,9 @@ function getState() {
     const filesSh = ss.getSheetByName(FILES_SHEET);
     const dupesSh = ss.getSheetByName(DUPES_SHEET);
 
-    // A sheet still on an older layout is reported as empty rather than trusted: its
-    // column 4 holds something other than the duplicate's file ID, and offering to
-    // trash by it would act on the wrong thing.
+    // A sheet still on an older layout is reported as empty rather than trusted: the
+    // position the current layout calls "Duplicate ID" holds something else entirely,
+    // and offering to trash by it would act on the wrong thing.
     let total = 0, pending = 0;
     if (dupesSh && headersMatch(dupesSh, DUPES_HEADERS)) {
       const n = dupesSh.getLastRow() - 1;

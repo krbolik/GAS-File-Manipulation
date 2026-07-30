@@ -1,12 +1,13 @@
 # Deduplicator — Handoff
 
-Written 2026-07-28, end of a long working session. Current state is in
-[STATUS.md](STATUS.md); the design rationale is in [ARCHITECTURE.md](ARCHITECTURE.md); how to
-*use* the tool is at the top of [README.md](README.md).
+Written 2026-07-28 at the end of a long working session; updated 2026-07-30, when the trash
+run came back complete. Current state is in [STATUS.md](STATUS.md); the design rationale is in
+[ARCHITECTURE.md](ARCHITECTURE.md); how to *use* the tool is at the top of
+[README.md](README.md).
 
 ---
 
-## Completed this session
+## Completed
 
 Nine releases, each pushed to the live project and byte-verified with `clasp pull`:
 
@@ -22,26 +23,35 @@ Nine releases, each pushed to the live project and byte-verified with `clasp pul
 | **v5.7** | **Background scanning** via a 5-minute time-driven trigger, capped at 5 h/day |
 | **v5.8** | **Background trashing**; Pause as a visible button; ledger day moved to US Pacific; hard guards on what may be trashed |
 | **v5.9** | The compare button retires itself once the pipeline is complete; both rebuild routes now confirm first |
+| **v5.10** | Clearing a sheet reclaims its cells again (`purgeSheet`); reset confirms first and stops background jobs; the dialog says to copy the list to the *Duplicate backup* file |
 
 Documentation: `ARCHITECTURE.md` written from scratch (component model, the hash-bucketing
 algorithm, complexity/capacity tables, ranked constraints, invariants, risk register), the
-operator instructions moved to the top of `README.md`, and this pair of files.
+operator instructions moved to the top of `README.md`, this pair of files, and the test harness
+committed at [`test/simulate.js`](test/simulate.js) (137 assertions, `node test/simulate.js`).
+
+**The 800 GB job is done.** The walk finished, the comparison ran, and the trash run completed.
+Before running it the reviewer deleted every row whose file was under 60 KB, which halved the
+work; those duplicates are still in Drive and are still recorded in `_scan_files`. See
+[STATUS.md](STATUS.md) for what that means and for the closing checklist.
 
 ## What to do first in the next session
 
-**The trash run has been started and was reported working.** So the job has moved on from
-"start trashing" to "confirm it finished correctly".
-
-1. **Run the validation in [STATUS.md](STATUS.md) §"Validating the trash run"** — four counts in
-   the sheet that must add up, plus a spot check against Drive. That section is written to be
-   usable with no memory of this conversation.
-2. **Read STATUS.md §"Two live conditions"** — the lost swap metadata and the cell trim. Both
-   still change what is safe to do.
-3. **Deal with the `Skipped:` rows.** They are the fingerprint of the swap decisions lost
-   earlier: the guard refused to trash a duplicate whose original was already in the bin. Each
-   needs a human decision — tick **Swap ⇄** to flip the sides and retry, or leave it.
-4. **Only then** consider whether anything remains to scan, and whether to fix the two defects
-   below before the next full compare.
+1. **Close the job out** — the checklist in [STATUS.md](STATUS.md) §"Closing out the 800 GB
+   job": reconcile the four counts, spot-check that a trashed row's original is still live,
+   work through the `Skipped:` rows. The 30-day Drive Trash window is the deadline for any of
+   it to be recoverable.
+2. **Do not compare.** With the sub-60 KB rows deleted by hand, a rebuild regenerates all of
+   them with an empty Status — i.e. queued for trashing, the opposite of the intent. That rules
+   out the menu's *Compare Files Scanned So Far*, *Analyze Folder* on the same URL, and any
+   background scan trigger, until the job is deliberately finished with.
+3. **Starting a different folder**: copy the `Duplicates` tab to the *Duplicate backup*
+   spreadsheet first (it is the only record of what was trashed), then **🚀 Angel → Reset Scan
+   Progress**. As of v5.10 that one action also deletes the rows — reclaiming the cells — and
+   removes any background trigger, so the manual cleanup this used to need is gone. STATUS has
+   the runbook.
+4. **Only then** consider the two unresolved defects below, both of which are worth fixing
+   before the next full compare on a list anyone cares about.
 
 ## Important implementation details
 
@@ -55,9 +65,11 @@ operator instructions moved to the top of `README.md`, and this pair of files.
   (`BG_DAY` + `BG_USED_MS`), whose day rolls at midnight **America/Los_Angeles** to match
   Google's quota reset.
 - **`trashOneRow` is the single gate on deletion.** A row is acted on only if it is present in
-  the sheet (re-read every batch, never cached — so deleting a row is final), has an empty
-  Status, carries a hash and a URL-safe file ID, and **its original is still alive**. That last
-  rule costs one Drive read per family, cached per execution, switchable via `VERIFY_KEEPER`.
+  the sheet, has an empty Status, carries a hash and a URL-safe file ID, and **its original is
+  still alive**. That last rule costs one Drive read per family, cached per execution,
+  switchable via `VERIFY_KEEPER`. "Present in the sheet" means re-read at the start of every
+  chunk and never cached — each execution snapshots the rows once, so deleting a row while
+  nothing is running is final, and deleting one mid-chunk takes effect at the next chunk.
 - **Three stores, three jobs.** Sheets hold bulk state; `ScriptProperties` holds five cursors
   plus the ledger; `CacheService` carries the live status and the pause flag — cache
   specifically because the property store is read into an execution once, so a running scan
